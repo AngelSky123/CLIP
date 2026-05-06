@@ -340,7 +340,7 @@ def main():
     os.makedirs(args_viz.save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model_args = get_config()
+    model_args = get_config(inference_only=True)
     print(f"\n{'='*60}")
     print(f"Loading model from: {args_viz.checkpoint}")
     model = CSIRSCPoseDG(model_args).to(device)
@@ -362,9 +362,14 @@ def main():
         args_viz.start_frame, model_args.seq_len
     )
 
-    print(f"\nRunning inference...")
+    # Get action index from args
+    action_idx_val = int(args_viz.action[1:]) - 1
+    action_idx_tensor = torch.tensor([action_idx_val], dtype=torch.long, device=device)
+
+    print(f"\nRunning inference (action={args_viz.action}, idx={action_idx_val})...")
     with torch.no_grad():
-        outputs = model(csi_tensor.to(device))
+        # With GT action (oracle)
+        outputs = model(csi_tensor.to(device), action_idx=action_idx_tensor)
         pred_tensor = outputs['p_final'].cpu()
 
     gt_np = gt_tensor[0].numpy()

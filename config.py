@@ -8,7 +8,7 @@ import argparse
 import os
 
 
-def get_config():
+def get_config(inference_only=False):
     parser = argparse.ArgumentParser(description='CSI-RSC-PoseDG')
 
     # ======================== Dataset ========================
@@ -67,9 +67,9 @@ def get_config():
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--beta', type=float, default=2.0,
                         help='Increased consistency weight for stronger RSC')
-    parser.add_argument('--gamma', type=float, default=0.005,
+    parser.add_argument('--gamma', type=float, default=0.0,
                         help='Weight for anti-collapse losses (diversity + temporal)')
-    parser.add_argument('--delta', type=float, default=0.02,
+    parser.add_argument('--delta', type=float, default=0.5,
                         help='Weight for action classification auxiliary loss')
 
     # ======================== Training ========================
@@ -91,5 +91,12 @@ def get_config():
     parser.add_argument('--eval_interval', type=int, default=3)
 
     args = parser.parse_args([])
+
+    # Auto-append timestamp so each run has its own directory
+    # Skip if --no_timestamp or if called for inference only
+    if not getattr(args, 'no_timestamp', False) and not inference_only:
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.save_dir = os.path.join(args.save_dir, f'run_{timestamp}')
     os.makedirs(args.save_dir, exist_ok=True)
     return args

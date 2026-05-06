@@ -1,5 +1,5 @@
 """
-CSI-RSC-PoseDG: 训练脚本 v3 — with anti-collapse losses
+CSI-RSC-PoseDG: 训练脚本 v4 — 动作条件化
 """
 import os
 import sys
@@ -22,7 +22,6 @@ from utils import (
 
 
 def action_to_index(action_str):
-    """Convert 'A01'~'A27' to integer 0~26."""
     return int(action_str[1:]) - 1
 
 
@@ -31,13 +30,10 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
     model.train()
     meters = {
         'loss': AverageMeter(),
-        'l_pose_masked': AverageMeter(),
         'l_pose_clean': AverageMeter(),
+        'l_pose_masked': AverageMeter(),
         'l_cons': AverageMeter(),
-        'l_div': AverageMeter(),
-        'l_temp_div': AverageMeter(),
         'l_action': AverageMeter(),
-        'l_coord': AverageMeter(),
     }
     accum_steps = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
@@ -51,16 +47,17 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
             dtype=torch.long, device=device
         )
 
-        # RSC forward
+        # RSC forward with action conditioning
         outputs = model.forward_rsc(
             csi, pose_3d,
-            loss_fn=lambda pred, gt: pose_loss_fn(pred, gt)[0]
+            loss_fn=lambda pred, gt: pose_loss_fn(pred, gt)[0],
+            action_idx=action_labels,
         )
 
         # Action classification loss
         action_loss = action_loss_fn(outputs['action_logits'], action_labels)
 
-        # Total loss with anti-collapse terms
+        # Total loss (gamma/delta from config)
         total_loss, loss_dict = loss_fn(
             outputs, pose_3d, training=True, action_loss=action_loss
         )
@@ -75,21 +72,18 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
 
         B = csi.shape[0]
         meters['loss'].update(loss_dict['l_total'], B)
-        meters['l_pose_masked'].update(loss_dict.get('l_pose_masked', 0), B)
         meters['l_pose_clean'].update(loss_dict.get('l_pose_clean', 0), B)
+        meters['l_pose_masked'].update(loss_dict.get('l_pose_masked', 0), B)
         meters['l_cons'].update(loss_dict.get('l_cons', 0), B)
-        meters['l_div'].update(loss_dict.get('l_div', 0), B)
-        meters['l_temp_div'].update(loss_dict.get('l_temp_div', 0), B)
         meters['l_action'].update(loss_dict.get('l_action', 0), B)
-        meters['l_coord'].update(loss_dict.get('l_coord_masked', 0), B)
 
         if (batch_idx + 1) % args.log_interval == 0:
             logger.info(
                 f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(train_loader)}] '
                 f'Loss: {meters["loss"].avg:.4f} '
+                f'Pose(C): {meters["l_pose_clean"].avg:.4f} '
                 f'Pose(M): {meters["l_pose_masked"].avg:.4f} '
-                f'Div: {meters["l_div"].avg:.4f} '
-                f'TDiv: {meters["l_temp_div"].avg:.4f} '
+                f'Cons: {meters["l_cons"].avg:.4f} '
                 f'Act: {meters["l_action"].avg:.4f}'
             )
 
@@ -102,51 +96,72 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
 @torch.no_grad()
 def evaluate(model, test_loader, loss_fn, device, evaluator, logger):
     model.eval()
-    all_preds = []
-    all_gts = []
+    all_preds, all_gts = [], []
+    all_preds_gt_action = []  # predictions using GT action (oracle)
     loss_meter = AverageMeter()
-
-    # Track prediction diversity
-    all_mean_poses = []
 
     for batch in test_loader:
         csi = batch['csi'].to(device)
         pose_3d = batch['pose_3d'].to(device)
+        action_labels = torch.tensor(
+            [action_to_index(a) for a in batch['action']],
+            dtype=torch.long, device=device
+        )
 
-        outputs = model(csi)
-        total_loss, loss_dict = loss_fn(outputs, pose_3d, training=False)
-        loss_meter.update(loss_dict['l_total'], csi.shape[0])
-
+        # Inference with predicted action (realistic)
+        outputs = model(csi, action_idx=None)
         pred = outputs['p_final']
         all_preds.append(pred.cpu())
         all_gts.append(pose_3d.cpu())
-        all_mean_poses.append(pred.mean(dim=1).cpu())  # (B, 17, 3)
 
-        del outputs, csi, pose_3d
+        # Inference with GT action (oracle upper bound)
+        outputs_oracle = model(csi, action_idx=action_labels)
+        all_preds_gt_action.append(outputs_oracle['p_final'].cpu())
+
+        # Action accuracy
+        action_pred = outputs['action_logits'].argmax(dim=-1)
+        action_acc = (action_pred == action_labels).float().mean().item()
+
+        total_loss, loss_dict = loss_fn(outputs_oracle, pose_3d, training=False)
+        loss_meter.update(loss_dict['l_total'], csi.shape[0])
+
+        del outputs, outputs_oracle, csi, pose_3d
         torch.cuda.empty_cache()
 
-    all_preds = torch.cat(all_preds, dim=0)
-    all_gts = torch.cat(all_gts, dim=0)
-    all_mean_poses = torch.cat(all_mean_poses, dim=0)  # (N, 17, 3)
+    preds = torch.cat(all_preds)
+    preds_oracle = torch.cat(all_preds_gt_action)
+    gts = torch.cat(all_gts)
 
-    metrics = evaluator.evaluate(all_preds, all_gts)
+    # Metrics with predicted action
+    metrics = evaluator.evaluate(preds, gts)
+    pred_std = preds.mean(dim=1).std(dim=0).mean().item() * 1000
 
-    # Prediction diversity: std of mean poses across samples
-    pred_std = all_mean_poses.std(dim=0).mean().item() * 1000
-    gt_std = all_gts.mean(dim=1).std(dim=0).mean().item() * 1000
+    # Metrics with GT action (oracle)
+    metrics_oracle = evaluator.evaluate(preds_oracle, gts)
+    pred_std_oracle = preds_oracle.mean(dim=1).std(dim=0).mean().item() * 1000
 
     logger.info(
-        f'[Eval] Loss: {loss_meter.avg:.4f} | '
+        f'[Eval-Pred] '
         f'MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
-        f'PA-MPJPE: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
-        f'PCK@50: {metrics["PCK@50 (%)"]:.1f}% | '
-        f'PCK@20: {metrics["PCK@20 (%)"]:.1f}% | '
-        f'PredStd: {pred_std:.1f}mm (GT: {gt_std:.1f}mm)'
+        f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
+        f'P50: {metrics["PCK@50 (%)"]:.1f}% | '
+        f'P20: {metrics["PCK@20 (%)"]:.1f}% | '
+        f'PredStd: {pred_std:.1f}mm'
+    )
+    logger.info(
+        f'[Eval-Oracle] '
+        f'MPJPE: {metrics_oracle["MPJPE (mm)"]:.2f}mm | '
+        f'PA: {metrics_oracle["PA-MPJPE (mm)"]:.2f}mm | '
+        f'P50: {metrics_oracle["PCK@50 (%)"]:.1f}% | '
+        f'P20: {metrics_oracle["PCK@20 (%)"]:.1f}% | '
+        f'PredStd: {pred_std_oracle:.1f}mm'
     )
 
-    metrics['pred_std'] = pred_std
-    metrics['gt_std'] = gt_std
-    return metrics
+    # Return oracle metrics for best model selection
+    metrics_oracle['pred_std'] = pred_std_oracle
+    metrics_oracle['pred_std_predicted'] = pred_std
+    metrics_oracle['MPJPE_predicted'] = metrics['MPJPE (mm)']
+    return metrics_oracle
 
 
 def main():
@@ -161,7 +176,7 @@ def main():
 
     logger.info(f'Configuration: {vars(args)}')
     logger.info(f'Device: {device}')
-    logger.info(f'Anti-collapse: gamma={args.gamma}, delta={args.delta}')
+    logger.info(f'Action-conditioned decoder enabled')
 
     data_exists = os.path.exists(args.data_root)
     train_loader, test_loader = build_dataloaders(args, synthetic=not data_exists)
@@ -197,8 +212,6 @@ def main():
         )
         logger.info(
             f'[Train] Epoch {epoch} | Loss: {train_metrics["loss"]:.4f} '
-            f'Div: {train_metrics["l_div"]:.4f} '
-            f'TDiv: {train_metrics["l_temp_div"]:.4f} '
             f'Act: {train_metrics["l_action"]:.4f} | '
             f'Time: {timer.elapsed_str()}'
         )
@@ -217,7 +230,7 @@ def main():
                     model, optimizer, epoch, eval_metrics,
                     os.path.join(args.save_dir, 'best_model.pth')
                 )
-                logger.info(f'*** New best MPJPE: {best_mpjpe:.2f}mm ***')
+                logger.info(f'*** New best MPJPE: {best_mpjpe:.2f}mm (Oracle) ***')
             else:
                 patience_counter += 1
                 logger.info(f'No improvement. Patience: {patience_counter}/{patience}')
@@ -227,10 +240,8 @@ def main():
                 break
 
         if epoch % 10 == 0:
-            save_checkpoint(
-                model, optimizer, epoch, {},
-                os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pth')
-            )
+            save_checkpoint(model, optimizer, epoch, {},
+                            os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pth'))
 
     logger.info(f'\n{"="*60}')
     logger.info(f'Training complete! Best MPJPE: {best_mpjpe:.2f}mm')

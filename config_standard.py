@@ -6,7 +6,7 @@ import argparse
 import os
 
 
-def get_config():
+def get_config(inference_only=False):
     parser = argparse.ArgumentParser(description='CSI-RSC-PoseDG Standard Split')
 
     # ======================== Dataset ========================
@@ -62,7 +62,7 @@ def get_config():
     parser.add_argument('--beta', type=float, default=2.0)
     parser.add_argument('--gamma', type=float, default=0.0,
                         help='Anti-collapse (0 for standard)')
-    parser.add_argument('--delta', type=float, default=0.0,
+    parser.add_argument('--delta', type=float, default=0.5,
                         help='Action classification (0 for standard)')
 
     # ======================== Training ========================
@@ -83,5 +83,10 @@ def get_config():
     parser.add_argument('--eval_interval', type=int, default=3)
 
     args = parser.parse_args([])
+
+    if not inference_only:
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.save_dir = os.path.join(args.save_dir, f'run_{timestamp}')
     os.makedirs(args.save_dir, exist_ok=True)
     return args
