@@ -9,7 +9,8 @@
 ## 主要特点
 
 - **双分支 CSI 编码器**：幅度与相位独立编码，可学习的 BN/IN 门控 + MixStyle 实现环境不变特征提取
-- **表示自挑战（RSC）**：训练时遮挡梯度最大的特征维度，迫使模型学习鲁棒表示
+- **表示自挑战（RSC）**：训练时遮挡梯度最大的特征维度，梯度回传到整个 backbone（v7.1 修复）
+- **动作条件化解码**：decoder 接收动作嵌入，训练时 50% 概率 Action Dropout 防止跨域级联失效
 - **由粗到精姿态解码**：MLP 粗回归 + 图卷积网络（GCN）骨架精调
 - **完整评估体系**：支持 3 种协议 × 3 种划分设定（共 9 组实验）
 
@@ -60,10 +61,14 @@ CSI 输入 (B, T, 9, 114, 10)
                               ┌──── z_global ────┐
                               │                  │
                          RSC 掩码            动作分类器
-                        (仅训练时)            (辅助任务)
-                              │
-                              ▼
-                     粗姿态头 (MLP): 128→256→51
+                        (仅训练时)         ┌──→ action_logits
+                              │            │       │
+                              ▼            │    action_emb (B, 32)
+                      z_global_masked      │    [训练: GT embedding]
+                              │            │    [推理: softmax 加权]
+                              │            │    [50% Action Dropout]
+                              ▼            ▼
+                     粗姿态头 (MLP): (128+32)→256→51
                               │
                               ▼
                    骨架精调器 (GCN): 3→128→128→3
@@ -72,7 +77,7 @@ CSI 输入 (B, T, 9, 114, 10)
                     P_final (B, T, 17, 3)
 ```
 
-**总参数量：1.60M**
+**总参数量：~1.62M**
 
 | 模块 | 参数量 | 说明 |
 |------|--------|------|
@@ -80,8 +85,8 @@ CSI 输入 (B, T, 9, 114, 10)
 | 局部编码器 | 443K | 2 个 Res3DConv 块，卷积核 (3,3,3) |
 | 特征池化 | 9K | 全局平均池化 + 线性投影 |
 | 全局建模器 | 810K | 3 层 Transformer (d=128, heads=4) + 2 层膨胀 TCN |
-| 姿态解码器 | 148K | 粗 MLP + GCN 骨架精调（H36M 17 关节） |
-| 动作分类器 | 20K | 辅助分类头，防止特征塌陷（仅训练） |
+| 姿态解码器 | 148K | 动作条件化粗 MLP + GCN 骨架精调（H36M 17 关节） |
+| 动作分类器 | 21K | 分类头 + Embedding(27, 32)，辅助任务（仅训练） |
 
 ### 各模块详细说明
 
@@ -108,9 +113,14 @@ CSI 输入 (B, T, 9, 114, 10)
 
 3 层 Pre-LN Transformer（d_model=128, 4 头注意力, FFN 扩展比 4×）捕捉长程时间依赖，2 层膨胀 TCN（dilation=1,2）补充局部时序平滑。前面插入 MixStyleTemporal 进一步混合跨环境时序统计量。
 
-**Module 5 — 姿态解码器**
+**Module 5 — 动作条件化姿态解码器**
 
-粗姿态头（MLP）直接回归 17×3=51 维坐标，骨架精调器（GCN）利用 H36M 骨架邻接矩阵做图卷积传播，以残差方式修正粗预测：`P_final = P_coarse + delta`。
+动作分类器（`ActionClassifier`）从 z_global 预测动作类别并生成动作嵌入向量（32 维）：
+- **训练时**：使用 GT 动作标签查表 `Embedding(27, 32)`
+- **推理时**：使用 softmax 概率加权平均所有嵌入向量
+- **Action Dropout（v7.1）**：训练时 50% 概率将 action_emb 置零，迫使 decoder 不过度依赖动作先验
+
+粗姿态头（MLP）接收 `[z_global, action_emb]` 拼接输入（128+32=160 维），直接回归 17×3=51 维坐标。骨架精调器（GCN）利用 H36M 骨架邻接矩阵做图卷积传播，以残差方式修正粗预测：`P_final = P_coarse + delta`。
 
 ## 数据集
 
@@ -236,8 +246,8 @@ CSI-RSC-PoseDG/
 │   ├── csi_encoder.py          # 双分支编码器（BN/IN 门控 + MixStyle）
 │   ├── local_encoder.py        # Res3DConv 块 + 特征池化
 │   ├── global_encoder.py       # Transformer + TCN + MixStyle
-│   ├── full_model.py           # 完整模型（含 RSC 训练逻辑）
-│   ├── pose_decoder.py         # 粗 MLP + GCN 骨架精调
+│   ├── full_model.py           # 完整模型（RSC 梯度修复 + Action Dropout）
+│   ├── pose_decoder.py         # 动作条件化粗 MLP + GCN 骨架精调
 │   ├── mixstyle.py             # MixStyle 层（2D / 时序）
 │   └── rsc.py                  # RSC 模块定义
 ├── config.py                   # 跨环境域泛化配置
@@ -270,26 +280,29 @@ CSI-RSC-PoseDG/
 
 ### 损失函数
 
-**标准模式：**
+**标准模式（`train_standard.py` / `train_experiment.py`）：**
 
-$$\mathcal{L} = \mathcal{L}_\text{coord} + \lambda_1 \mathcal{L}_\text{bone} + \lambda_2 \mathcal{L}_\text{vel}$$
+$$\mathcal{L} = \mathcal{L}_\text{coord} + \lambda_1 \mathcal{L}_\text{bone} + \lambda_2 \mathcal{L}_\text{vel} + \delta \mathcal{L}_\text{action}$$
 
 - $\mathcal{L}_\text{coord}$：逐关节 L2 距离
 - $\mathcal{L}_\text{bone}$：骨骼长度一致性（L1）
 - $\mathcal{L}_\text{vel}$：速度平滑性
+- $\mathcal{L}_\text{action}$：动作分类交叉熵
 
-**域泛化模式（含 RSC）：**
+**域泛化模式（`train.py`，含 RSC + forward_rsc）：**
 
 $$\mathcal{L} = \mathcal{L}_\text{pose}^\text{clean} + \alpha \mathcal{L}_\text{pose}^\text{masked} + \beta \mathcal{L}_\text{cons} + \gamma (\mathcal{L}_\text{div} + \mathcal{L}_\text{tdiv} + \mathcal{L}_\text{input}) + \delta \mathcal{L}_\text{action}$$
 
-| 损失项 | 权重 | 说明 |
-|--------|------|------|
-| $\mathcal{L}_\text{pose}^\text{clean}$ | 1.0 | 主姿态损失，梯度回传到 backbone |
-| $\mathcal{L}_\text{pose}^\text{masked}$ | α=0.5 | RSC 遮挡路径损失，仅更新 decoder |
-| $\mathcal{L}_\text{cons}$ | β=2.0 | 遮挡/未遮挡预测一致性 |
-| $\mathcal{L}_\text{div}$ | γ=0.005 | 惩罚 batch 内预测方差过低 |
-| $\mathcal{L}_\text{tdiv}$ | γ=0.005 | 惩罚时序动态不足 |
-| $\mathcal{L}_\text{action}$ | δ=0.02 | 动作分类辅助任务 |
+| 损失项 | 权重 | 梯度流向 | 说明 |
+|--------|------|----------|------|
+| $\mathcal{L}_\text{pose}^\text{clean}$ | 1.0 | backbone + decoder | 主姿态损失 |
+| $\mathcal{L}_\text{pose}^\text{masked}$ | α=0.5 | backbone + decoder | RSC 遮挡路径损失（v7.1: 梯度经未遮挡元素回传到 backbone） |
+| $\mathcal{L}_\text{cons}$ | β=2.0 | decoder | 遮挡/未遮挡预测一致性（clean 侧 detach） |
+| $\mathcal{L}_\text{div}$ | γ=0.0 | backbone + decoder | 惩罚 batch 内预测方差过低（默认关闭） |
+| $\mathcal{L}_\text{tdiv}$ | γ=0.0 | backbone + decoder | 惩罚时序动态不足（默认关闭） |
+| $\mathcal{L}_\text{action}$ | δ=0.5 | backbone + classifier | 动作分类辅助任务 |
+
+> **关于 γ=0.0**：`config.py` 默认关闭反塌陷损失。如需启用可设 `--gamma 0.005`。`losses.py` 中 TotalLoss 的初始化默认值 (γ=0.005) 为历史遗留，实际运行时始终由 config 覆盖。
 
 ## 域泛化技术汇总
 
@@ -298,8 +311,9 @@ $$\mathcal{L} = \mathcal{L}_\text{pose}^\text{clean} + \alpha \mathcal{L}_\text{
 | **InstanceNorm 门控** | CSI 编码器 | 可学习地混合 BN（共享统计量）和 IN（逐样本统计量），抑制环境特异性统计 |
 | **MixStyle** | CSI 编码器 + 全局建模器 | 训练时随机混合样本间特征统计量，合成虚拟域 |
 | **CSI 数据增强** | 数据加载 | 幅度缩放、相位噪声、子载波丢弃、频域遮挡，模拟环境变化 |
-| **RSC** | z_global | 遮挡梯度最大的 50% 特征维度，迫使模型使用多样化特征子集 |
-| **多样性损失** | 训练目标 | 惩罚预测方差过低 (L_div)、时序动态不足 (L_tdiv)、输入不敏感 (L_input) |
+| **RSC** | z_global | 遮挡梯度最大的 50% 特征维度，梯度回传到整个 backbone（v7.1 修复） |
+| **Action Dropout** | forward_rsc | 训练时 50% 概率将动作嵌入置零，防止 decoder 过度依赖动作先验导致跨域级联失效 |
+| **多样性损失** | 训练目标 | 惩罚预测方差过低 (L_div)、时序动态不足 (L_tdiv)、输入不敏感 (L_input)（默认关闭） |
 | **动作分类器** | 辅助分支 | 迫使编码器在 z_global 中保留动作区分信息 |
 
 ## 关键发现
