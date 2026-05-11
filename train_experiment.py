@@ -322,25 +322,37 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, grad_clip=1.0, ac
 
 @torch.no_grad()
 def evaluate(model, loader, device, evaluator):
+    """严格评估: action_idx=None, 不使用测试集 GT 动作标签."""
     model.eval()
     all_preds, all_gts = [], []
+    action_correct, action_total = 0, 0
 
     for batch in loader:
         csi = batch['csi'].to(device)
         pose = batch['pose_3d'].to(device)
+
+        # ★ 严格 DG: 不透露测试集动作标签
+        out = model(csi, action_idx=None)
+        all_preds.append(out['p_final'].cpu())
+        all_gts.append(pose.cpu())
+
+        # 动作准确率 (仅指标, 不作为模型输入)
         action_labels = torch.tensor(
             [int(a[1:]) - 1 for a in batch['action']],
             dtype=torch.long, device=device
         )
-        out = model(csi, action_idx=action_labels)  # Oracle (GT action)
-        all_preds.append(out['p_final'].cpu())
-        all_gts.append(pose.cpu())
+        action_pred = out['action_logits'].argmax(dim=-1)
+        action_correct += (action_pred == action_labels).sum().item()
+        action_total += action_labels.shape[0]
+
         del out, csi, pose
         torch.cuda.empty_cache()
 
     preds = torch.cat(all_preds)
     gts = torch.cat(all_gts)
-    return evaluator.evaluate(preds, gts)
+    metrics = evaluator.evaluate(preds, gts)
+    metrics['action_acc'] = 100.0 * action_correct / max(action_total, 1)
+    return metrics
 
 
 def run_single_experiment(args):

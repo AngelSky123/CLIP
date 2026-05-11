@@ -1,5 +1,8 @@
 """
-CSI-RSC-PoseDG: 训练脚本 v4 — 动作条件化
+CSI-RSC-PoseDG: 训练脚本 v5 — 严格域泛化
+  - 评估时完全不使用测试集 GT 动作标签
+  - 模型必须自行从 CSI 预测动作 (action_idx=None)
+  - Best model 按 Predicted 模式 MPJPE 选择
 """
 import os
 import sys
@@ -42,22 +45,19 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
     for batch_idx, batch in enumerate(train_loader):
         csi = batch['csi'].to(device)
         pose_3d = batch['pose_3d'].to(device)
+        # 训练时使用 GT 动作标签 (仅源域数据)
         action_labels = torch.tensor(
             [action_to_index(a) for a in batch['action']],
             dtype=torch.long, device=device
         )
 
-        # RSC forward with action conditioning
         outputs = model.forward_rsc(
             csi, pose_3d,
             loss_fn=lambda pred, gt: pose_loss_fn(pred, gt)[0],
             action_idx=action_labels,
         )
 
-        # Action classification loss
         action_loss = action_loss_fn(outputs['action_logits'], action_labels)
-
-        # Total loss (gamma/delta from config)
         total_loss, loss_dict = loss_fn(
             outputs, pose_3d, training=True, action_loss=action_loss
         )
@@ -94,74 +94,57 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, pose_loss_fn,
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, loss_fn, device, evaluator, logger):
+def evaluate(model, test_loader, device, evaluator, logger):
+    """严格域泛化评估: 不使用测试集任何 GT 标签作为模型输入.
+
+    模型只接收 CSI 输入, 自行预测动作和姿态.
+    GT 仅用于计算评估指标 (MPJPE 等), 不参与推理.
+    """
     model.eval()
     all_preds, all_gts = [], []
-    all_preds_gt_action = []  # predictions using GT action (oracle)
-    loss_meter = AverageMeter()
+    action_correct, action_total = 0, 0
 
     for batch in test_loader:
         csi = batch['csi'].to(device)
         pose_3d = batch['pose_3d'].to(device)
+
+        # ★ 严格 DG: action_idx=None, 模型自行预测动作
+        outputs = model(csi, action_idx=None)
+        all_preds.append(outputs['p_final'].cpu())
+        all_gts.append(pose_3d.cpu())
+
+        # 动作分类准确率 (GT 仅用于计算指标, 不作为模型输入)
         action_labels = torch.tensor(
             [action_to_index(a) for a in batch['action']],
             dtype=torch.long, device=device
         )
-
-        # Inference with predicted action (realistic)
-        outputs = model(csi, action_idx=None)
-        pred = outputs['p_final']
-        all_preds.append(pred.cpu())
-        all_gts.append(pose_3d.cpu())
-
-        # Inference with GT action (oracle upper bound)
-        outputs_oracle = model(csi, action_idx=action_labels)
-        all_preds_gt_action.append(outputs_oracle['p_final'].cpu())
-
-        # Action accuracy
         action_pred = outputs['action_logits'].argmax(dim=-1)
-        action_acc = (action_pred == action_labels).float().mean().item()
+        action_correct += (action_pred == action_labels).sum().item()
+        action_total += action_labels.shape[0]
 
-        total_loss, loss_dict = loss_fn(outputs_oracle, pose_3d, training=False)
-        loss_meter.update(loss_dict['l_total'], csi.shape[0])
-
-        del outputs, outputs_oracle, csi, pose_3d
+        del outputs, csi, pose_3d
         torch.cuda.empty_cache()
 
     preds = torch.cat(all_preds)
-    preds_oracle = torch.cat(all_preds_gt_action)
     gts = torch.cat(all_gts)
 
-    # Metrics with predicted action
     metrics = evaluator.evaluate(preds, gts)
     pred_std = preds.mean(dim=1).std(dim=0).mean().item() * 1000
-
-    # Metrics with GT action (oracle)
-    metrics_oracle = evaluator.evaluate(preds_oracle, gts)
-    pred_std_oracle = preds_oracle.mean(dim=1).std(dim=0).mean().item() * 1000
+    action_acc = 100.0 * action_correct / max(action_total, 1)
 
     logger.info(
-        f'[Eval-Pred] '
+        f'[Eval] '
         f'MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
         f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
         f'P50: {metrics["PCK@50 (%)"]:.1f}% | '
         f'P20: {metrics["PCK@20 (%)"]:.1f}% | '
-        f'PredStd: {pred_std:.1f}mm'
-    )
-    logger.info(
-        f'[Eval-Oracle] '
-        f'MPJPE: {metrics_oracle["MPJPE (mm)"]:.2f}mm | '
-        f'PA: {metrics_oracle["PA-MPJPE (mm)"]:.2f}mm | '
-        f'P50: {metrics_oracle["PCK@50 (%)"]:.1f}% | '
-        f'P20: {metrics_oracle["PCK@20 (%)"]:.1f}% | '
-        f'PredStd: {pred_std_oracle:.1f}mm'
+        f'PredStd: {pred_std:.1f}mm | '
+        f'ActAcc: {action_acc:.1f}%'
     )
 
-    # Return oracle metrics for best model selection
-    metrics_oracle['pred_std'] = pred_std_oracle
-    metrics_oracle['pred_std_predicted'] = pred_std
-    metrics_oracle['MPJPE_predicted'] = metrics['MPJPE (mm)']
-    return metrics_oracle
+    metrics['pred_std'] = pred_std
+    metrics['action_acc'] = action_acc
+    return metrics
 
 
 def main():
@@ -176,7 +159,7 @@ def main():
 
     logger.info(f'Configuration: {vars(args)}')
     logger.info(f'Device: {device}')
-    logger.info(f'Action-conditioned decoder enabled')
+    logger.info(f'Strict DG: test-time action_idx=None (no GT labels)')
 
     data_exists = os.path.exists(args.data_root)
     train_loader, test_loader = build_dataloaders(args, synthetic=not data_exists)
@@ -220,7 +203,7 @@ def main():
 
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
             eval_metrics = evaluate(
-                model, test_loader, loss_fn, device, evaluator, logger
+                model, test_loader, device, evaluator, logger
             )
             current_mpjpe = eval_metrics['MPJPE (mm)']
             if current_mpjpe < best_mpjpe:
@@ -230,7 +213,7 @@ def main():
                     model, optimizer, epoch, eval_metrics,
                     os.path.join(args.save_dir, 'best_model.pth')
                 )
-                logger.info(f'*** New best MPJPE: {best_mpjpe:.2f}mm (Oracle) ***')
+                logger.info(f'*** New best MPJPE: {best_mpjpe:.2f}mm ***')
             else:
                 patience_counter += 1
                 logger.info(f'No improvement. Patience: {patience_counter}/{patience}')

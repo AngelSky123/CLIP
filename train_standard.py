@@ -1,5 +1,5 @@
 """
-CSI-PoseDG: 标准训练脚本 v2 — 动作条件化, 8:2 split
+CSI-PoseDG: 标准训练脚本 v3 — 严格评估 (无 Oracle)
 """
 import os
 import sys
@@ -42,6 +42,7 @@ def train_one_epoch(model, train_loader, optimizer, pose_loss_fn,
             dtype=torch.long, device=device
         )
 
+        # 训练时用 GT 动作 (源域/训练集, 合规)
         outputs = model(csi, action_idx=action_labels)
         pose_loss, _ = pose_loss_fn(outputs['p_final'], pose_3d)
         action_loss = action_loss_fn(outputs['action_logits'], action_labels)
@@ -73,64 +74,61 @@ def train_one_epoch(model, train_loader, optimizer, pose_loss_fn,
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, pose_loss_fn, device, evaluator, logger):
+def evaluate(model, test_loader, device, evaluator, logger):
+    """严格评估: action_idx=None, 不使用测试集 GT 动作标签."""
     model.eval()
     all_preds, all_gts, all_envs = [], [], []
-    all_preds_oracle = []
+    action_correct, action_total = 0, 0
 
     for batch in test_loader:
         csi = batch['csi'].to(device)
         pose_3d = batch['pose_3d'].to(device)
-        action_labels = torch.tensor(
-            [action_to_index(a) for a in batch['action']],
-            dtype=torch.long, device=device
-        )
 
-        # Predicted action
+        # ★ 不透露测试集动作标签
         out = model(csi, action_idx=None)
         all_preds.append(out['p_final'].cpu())
         all_gts.append(pose_3d.cpu())
         all_envs.extend(batch['env'])
 
-        # Oracle (GT action)
-        out_oracle = model(csi, action_idx=action_labels)
-        all_preds_oracle.append(out_oracle['p_final'].cpu())
+        # 动作准确率 (仅指标, 不作为输入)
+        action_labels = torch.tensor(
+            [action_to_index(a) for a in batch['action']],
+            dtype=torch.long, device=device
+        )
+        action_pred = out['action_logits'].argmax(dim=-1)
+        action_correct += (action_pred == action_labels).sum().item()
+        action_total += action_labels.shape[0]
 
-        del out, out_oracle, csi, pose_3d
+        del out, csi, pose_3d
         torch.cuda.empty_cache()
 
     preds = torch.cat(all_preds)
-    preds_oracle = torch.cat(all_preds_oracle)
     gts = torch.cat(all_gts)
 
     metrics = evaluator.evaluate(preds, gts)
-    metrics_oracle = evaluator.evaluate(preds_oracle, gts)
     pred_std = preds.mean(dim=1).std(dim=0).mean().item() * 1000
-    pred_std_oracle = preds_oracle.mean(dim=1).std(dim=0).mean().item() * 1000
+    action_acc = 100.0 * action_correct / max(action_total, 1)
 
     logger.info(
-        f'[Eval-Pred]   MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
+        f'[Eval] MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
         f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
         f'P50: {metrics["PCK@50 (%)"]:.1f}% | '
-        f'PredStd: {pred_std:.1f}mm'
-    )
-    logger.info(
-        f'[Eval-Oracle] MPJPE: {metrics_oracle["MPJPE (mm)"]:.2f}mm | '
-        f'PA: {metrics_oracle["PA-MPJPE (mm)"]:.2f}mm | '
-        f'P50: {metrics_oracle["PCK@50 (%)"]:.1f}% | '
-        f'PredStd: {pred_std_oracle:.1f}mm'
+        f'P20: {metrics["PCK@20 (%)"]:.1f}% | '
+        f'PredStd: {pred_std:.1f}mm | '
+        f'ActAcc: {action_acc:.1f}%'
     )
 
-    # Per-env breakdown (oracle)
+    # Per-env breakdown
     env_set = sorted(set(all_envs))
     if len(env_set) > 1:
         for env in env_set:
             mask = torch.tensor([i for i, e in enumerate(all_envs) if e == env])
-            em = evaluator.evaluate(preds_oracle[mask], gts[mask])
+            em = evaluator.evaluate(preds[mask], gts[mask])
             logger.info(f'  [{env}] MPJPE: {em["MPJPE (mm)"]:.2f}mm | n={len(mask)}')
 
-    metrics_oracle['pred_std'] = pred_std_oracle
-    return metrics_oracle
+    metrics['pred_std'] = pred_std
+    metrics['action_acc'] = action_acc
+    return metrics
 
 
 def main():
@@ -141,7 +139,7 @@ def main():
     logger = setup_logger('CSI-Standard',
                           log_file=os.path.join(args.save_dir, 'train.log'))
 
-    logger.info(f'STANDARD 8:2 SPLIT — Action-Conditioned')
+    logger.info(f'STANDARD 8:2 SPLIT — Strict eval (no Oracle)')
     logger.info(f'Configuration: {vars(args)}')
 
     train_loader, test_loader = build_dataloaders(args)
@@ -171,7 +169,7 @@ def main():
         scheduler.step()
 
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
-            em = evaluate(model, test_loader, pose_loss_fn, device, evaluator, logger)
+            em = evaluate(model, test_loader, device, evaluator, logger)
             cur = em['MPJPE (mm)']
             if cur < best_mpjpe:
                 best_mpjpe = cur
