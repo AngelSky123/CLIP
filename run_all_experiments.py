@@ -36,7 +36,7 @@ def find_best_result(save_root, protocol, setting, test_env=None):
                 results.append(r)
         if results:
             avg = {}
-            for key in ['MPJPE (mm)', 'PA-MPJPE (mm)', 'PCK@50 (%)', 'PCK@20 (%)']:
+            for key in ['MPJPE (mm)', 'PA-MPJPE (mm)', 'PCK@50_norm (%)', 'PCK@20_norm (%)']:
                 vals = [r[key] for r in results if key in r]
                 avg[key] = sum(vals) / len(vals) if vals else 0
             return {'protocol': protocol, 'setting': 'S3', 'test_env': 'average', **avg}
@@ -109,8 +109,8 @@ def print_results_table(save_root):
         for p in PROTOCOLS:
             r = find_best_result(save_root, p, s)
             if r:
-                row += f'  {r.get("PCK@20 (%)", 0):>8.1f}'
-                row += f' {r.get("PCK@50 (%)", 0):>8.1f}'
+                row += f'  {r.get("PCK@20_norm (%)", 0):>8.1f}'
+                row += f' {r.get("PCK@50_norm (%)", 0):>8.1f}'
                 row += f' {r.get("MPJPE (mm)", 0):>8.1f}'
                 row += f' {r.get("PA-MPJPE (mm)", 0):>8.1f}'
             else:
@@ -125,8 +125,8 @@ def print_results_table(save_root):
                 for p in PROTOCOLS:
                     r = find_best_result(save_root, p, s, env)
                     if r:
-                        env_row += f'  {r.get("PCK@20 (%)", 0):>8.1f}'
-                        env_row += f' {r.get("PCK@50 (%)", 0):>8.1f}'
+                        env_row += f'  {r.get("PCK@20_norm (%)", 0):>8.1f}'
+                        env_row += f' {r.get("PCK@50_norm (%)", 0):>8.1f}'
                         env_row += f' {r.get("MPJPE (mm)", 0):>8.1f}'
                         env_row += f' {r.get("PA-MPJPE (mm)", 0):>8.1f}'
                     else:
@@ -137,14 +137,14 @@ def print_results_table(save_root):
     # Also save as CSV
     csv_path = os.path.join(save_root, 'results_summary.csv')
     with open(csv_path, 'w') as f:
-        f.write('Setting,Protocol,PCK@20,PCK@50,MPJPE,PA-MPJPE\n')
+        f.write('Setting,Protocol,PCK@20_norm,PCK@50_norm,MPJPE,PA-MPJPE\n')
         for s in SETTINGS:
             for p in PROTOCOLS:
                 r = find_best_result(save_root, p, s)
                 if r:
                     f.write(f'{s},{p},'
-                            f'{r.get("PCK@20 (%)", ""):.1f},'
-                            f'{r.get("PCK@50 (%)", ""):.1f},'
+                            f'{r.get("PCK@20_norm (%)", ""):.1f},'
+                            f'{r.get("PCK@50_norm (%)", ""):.1f},'
                             f'{r.get("MPJPE (mm)", ""):.1f},'
                             f'{r.get("PA-MPJPE (mm)", ""):.1f}\n')
                 else:

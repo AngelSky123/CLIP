@@ -29,7 +29,7 @@ from scipy.io import loadmat
 from config import get_config
 from models.full_model import CSIRSCPoseDG
 from dataset import CSIPreprocessor
-from evaluate import mpjpe, pa_mpjpe, pck, procrustes_align
+from evaluate import mpjpe, pa_mpjpe, pck, pck_normalized
 
 
 # ==================== H36M Skeleton ====================
@@ -397,21 +397,24 @@ def main():
     pred_eval = pred_tensor[:, :actual_len]
     mpjpe_val = mpjpe(pred_eval, gt_eval) * 1000
     pa_mpjpe_val = pa_mpjpe(pred_eval, gt_eval) * 1000
-    pck50_val = pck(pred_eval, gt_eval, threshold=0.05)
-    pck20_val = pck(pred_eval, gt_eval, threshold=0.02)
-    print(f"  MPJPE:    {mpjpe_val:.2f} mm")
-    print(f"  PA-MPJPE: {pa_mpjpe_val:.2f} mm")
-    print(f"  PCK@50:   {pck50_val:.1f}%")
-    print(f"  PCK@20:   {pck20_val:.1f}%")
+    pck50_val = pck_normalized(pred_eval, gt_eval, thr=0.5)
+    pck20_val = pck_normalized(pred_eval, gt_eval, thr=0.2)
+    frame_idx = min(args_viz.frame, actual_len - 1)
+    frame_err = np.linalg.norm(gt_np[frame_idx] - pred_np[frame_idx], axis=-1).mean() * 1000
+
+    print(f"  [Frame {frame_idx}]")
+    print(f"    MPJPE:    {frame_err:.2f} mm")
+    print(f"  [Sequence avg]")
+    print(f"    MPJPE:    {mpjpe_val:.2f} mm")
+    print(f"    PA-MPJPE: {pa_mpjpe_val:.2f} mm")
+    print(f"    PCK@50_n: {pck50_val:.1f}%")
+    print(f"    PCK@20_n: {pck20_val:.1f}%")
 
     metrics_text = f'MPJPE={mpjpe_val:.1f}mm  PA-MPJPE={pa_mpjpe_val:.1f}mm'
     prefix = f"{args_viz.env}_{args_viz.subject}_{args_viz.action}"
 
     print(f"\n{'='*60}")
     print("Generating visualizations...")
-
-    frame_idx = min(args_viz.frame, actual_len - 1)
-    frame_err = np.linalg.norm(gt_np[frame_idx] - pred_np[frame_idx], axis=-1).mean() * 1000
 
     visualize_single_frame(
         gt_np, pred_np, frame_idx,

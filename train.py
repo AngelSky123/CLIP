@@ -133,14 +133,15 @@ def evaluate(model, test_loader, device, evaluator, logger):
     action_acc = 100.0 * action_correct / max(action_total, 1)
 
     logger.info(
-        f'[Eval] '
-        f'MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
-        f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
-        f'P50: {metrics["PCK@50 (%)"]:.1f}% | '
-        f'P20: {metrics["PCK@20 (%)"]:.1f}% | '
-        f'PredStd: {pred_std:.1f}mm | '
-        f'ActAcc: {action_acc:.1f}%'
-    )
+    f'[Eval] '
+    f'MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
+    f'MPJPE_a: {metrics["MPJPE_aligned (mm)"]:.2f}mm | '
+    f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
+    f'P50n: {metrics["PCK@50_norm (%)"]:.1f}% | '
+    f'P20n: {metrics["PCK@20_norm (%)"]:.1f}% | '
+    f'PredStd: {pred_std:.1f}mm | '
+    f'ActAcc: {action_acc:.1f}%'
+)
 
     metrics['pred_std'] = pred_std
     metrics['action_acc'] = action_acc
@@ -169,11 +170,11 @@ def main():
     logger.info(f'Model parameters: {count_parameters(model):,}')
 
     loss_fn = TotalLoss(
-        lambda1=args.lambda1, lambda2=args.lambda2,
+        lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3,
         alpha=args.alpha, beta=args.beta,
         gamma=args.gamma, delta=args.delta,
     )
-    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2)
+    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3)
     evaluator = PoseEvaluator(unit='meter')
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -184,8 +185,32 @@ def main():
     best_mpjpe = float('inf')
     patience_counter = 0
     patience = getattr(args, 'patience', 15)
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # ============================================================
+    # Resume from checkpoint if specified
+    # ============================================================
+    if getattr(args, 'resume', ''):
+        if not os.path.exists(args.resume):
+            logger.error(f'Resume checkpoint not found: {args.resume}')
+            raise FileNotFoundError(args.resume)
+        logger.info(f'Resuming from checkpoint: {args.resume}')
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        except Exception as e:
+            logger.warning(f'Could not restore optimizer state: {e}')
+        start_epoch = ckpt.get('epoch', 0) + 1
+        if 'metrics' in ckpt and ckpt['metrics']:
+            best_mpjpe = ckpt['metrics'].get('MPJPE (mm)', float('inf'))
+            logger.info(f'  Loaded best_mpjpe = {best_mpjpe:.2f}mm from checkpoint metrics')
+        # Step scheduler forward to current epoch
+        for _ in range(start_epoch - 1):
+            scheduler.step()
+        logger.info(f'  Resuming at epoch {start_epoch}, LR = {scheduler.get_last_lr()[0]:.6f}')
+
+    for epoch in range(start_epoch, args.epochs + 1):
         logger.info(f'\n{"="*60}')
         logger.info(f'Epoch {epoch}/{args.epochs} | LR: {scheduler.get_last_lr()[0]:.6f}')
 

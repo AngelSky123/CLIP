@@ -1,5 +1,6 @@
 """
-CSI-RSC-PoseDG 配置文件 v2
+CSI-RSC-PoseDG 配置文件 v2.1
+- 修复: parse_args([]) → parse_args() 以接受命令行参数
 - Root-relative coordinates
 - Stronger RSC
 - Early stopping patience
@@ -64,6 +65,8 @@ def get_config(inference_only=False):
     # ======================== Loss Weights ========================
     parser.add_argument('--lambda1', type=float, default=1.0)
     parser.add_argument('--lambda2', type=float, default=0.5)
+    parser.add_argument('--lambda3', type=float, default=2.0,
+                        help='Weight for MotionGuidanceLoss (anti temporal collapse)')
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--beta', type=float, default=2.0,
                         help='Increased consistency weight for stronger RSC')
@@ -74,26 +77,37 @@ def get_config(inference_only=False):
 
     # ======================== Training ========================
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--accumulate_grad', type=int, default=4)
+    parser.add_argument('--accumulate_grad', '--accum', type=int, default=4)
     parser.add_argument('--patience', type=int, default=15,
                         help='Early stopping patience on eval MPJPE')
 
     # ======================== Logging ========================
+    parser.add_argument('--resume', type=str, default='',
+                        help='Path to checkpoint to resume from')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--eval_interval', type=int, default=3)
 
-    args = parser.parse_args([])
+    # ======================== Parse ========================
+    # v2.1 修复: parse_args([]) → parse_known_args() 以接受命令行参数
+    # parse_args([]) 会忽略所有命令行参数, 导致 --alpha/--beta 等不生效
+    # parse_known_args() 解析已知参数, 未知参数 (如 --protocol) 会被忽略并警告
+    if inference_only:
+        args = parser.parse_args([])  # 推理模式不需要命令行参数
+    else:
+        args, unknown = parser.parse_known_args()
+        if unknown:
+            import warnings
+            warnings.warn(f"Ignoring unrecognized arguments: {unknown}")
 
     # Auto-append timestamp so each run has its own directory
-    # Skip if --no_timestamp or if called for inference only
     if not getattr(args, 'no_timestamp', False) and not inference_only:
         from datetime import datetime
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

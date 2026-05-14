@@ -1,14 +1,19 @@
 """
-Training objectives v3 — fixed gradient flow documentation
+Training objectives v5 — MotionGuidanceLoss for temporal collapse
 
 Loss structure:
+  L_pose = L_coord + λ1·L_bone + λ2·L_vel + λ3·L_motion
   L_total = L_pose(clean) + α·L_pose(masked) + β·L_cons + γ·(div losses) + δ·L_action
 
-  - L_pose(clean):  PRIMARY loss — gradients flow to BACKBONE + DECODER
-  - L_pose(masked): RSC regularization — gradients flow to DECODER only
-  - L_cons:         Consistency between clean and masked predictions
-  - L_div/L_temp:   Anti-collapse regularization
-  - L_action:       Action classification auxiliary task
+New in v5 — MotionGuidanceLoss (λ3):
+  VelocitySmoothLoss fails to break temporal collapse because its gradient
+  is proportional to GT acceleration (≈0 for smooth human motion).
+  MotionGuidanceLoss uses .detach() to decouple consecutive frames, giving
+  each frame an independent gradient in the GT displacement direction.
+
+  Gradient analysis at static prediction (pred[t]=c for all t):
+    VelocitySmoothLoss: ∂L/∂pred[t] ∝ gt_accel[t] → ≈0 (smooth motion)
+    MotionGuidanceLoss: ∂L/∂pred[t] = -sign(gt_disp[t]) → always ±1 ✓
 """
 import torch
 import torch.nn as nn
@@ -50,6 +55,34 @@ class VelocitySmoothLoss(nn.Module):
         pred_vel = pred[:, 1:] - pred[:, :-1]
         gt_vel = gt[:, 1:] - gt[:, :-1]
         return torch.norm(pred_vel - gt_vel, dim=-1).mean()
+
+
+class MotionGuidanceLoss(nn.Module):
+    """Break temporal collapse via detach-based per-frame motion guidance.
+
+    Problem with VelocitySmoothLoss:
+      loss = ||pred_vel[t] - gt_vel[t]||
+      When pred is static, ∂loss/∂pred[t] ∝ gt_acceleration (≈0 for smooth motion).
+      The gradients from consecutive frames CANCEL because they enter as a difference.
+
+    Solution: detach pred[t-1] to break the gradient coupling.
+      target[t] = pred[t-1].detach() + (gt[t] - gt[t-1])
+      loss = ||pred[t] - target[t]||
+
+    When pred is static (pred[t] = c for all t):
+      ∂loss/∂pred[t] = sign(c - (c + gt_disp)) = -sign(gt_disp[t])
+      → pushes pred[t] in the GT displacement direction
+      → independent per frame, no cancellation
+      → magnitude is always 1 (L1), regardless of motion smoothness
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, gt):
+        gt_disp = gt[:, 1:] - gt[:, :-1]          # (B, T-1, 17, 3)
+        target = pred[:, :-1].detach() + gt_disp   # where pred[t] should be
+        return F.l1_loss(pred[:, 1:], target)
 
 
 class ConsistencyLoss(nn.Module):
@@ -131,39 +164,57 @@ class InputSensitivityLoss(nn.Module):
 
 
 class PoseLoss(nn.Module):
-    def __init__(self, lambda1=1.0, lambda2=0.5):
+    def __init__(self, lambda1=1.0, lambda2=0.5, lambda3=2.0):
         super().__init__()
         self.coord_loss = CoordinateLoss()
         self.bone_loss = BoneConsistencyLoss()
         self.vel_loss = VelocitySmoothLoss()
+        self.motion_guidance = MotionGuidanceLoss()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
+        self.lambda3 = lambda3
 
     def forward(self, pred, gt):
         l_coord = self.coord_loss(pred, gt)
         l_bone = self.bone_loss(pred, gt)
         l_vel = self.vel_loss(pred, gt)
-        total = l_coord + self.lambda1 * l_bone + self.lambda2 * l_vel
+        l_motion = self.motion_guidance(pred, gt)
+        total = (l_coord
+                 + self.lambda1 * l_bone
+                 + self.lambda2 * l_vel
+                 + self.lambda3 * l_motion)
         return total, {
             'l_coord': l_coord.item(),
             'l_bone': l_bone.item(),
             'l_vel': l_vel.item(),
+            'l_motion': l_motion.item(),
         }
 
 
 class TotalLoss(nn.Module):
-    """
-    L = L_pose(clean)                  ← backbone + decoder gradients
-      + α · L_pose(masked)             ← decoder only (RSC regularization)
-      + β · L_cons                     ← consistency
-      + γ · (L_div + L_temp + L_input) ← anti-collapse
-      + δ · L_action                   ← auxiliary task
+    """域泛化联合损失 (用于 train.py 的 forward_rsc 训练路径).
+
+    L = L_pose(clean)                  ← backbone + decoder 梯度 (主损失)
+      + α · L_pose(masked)             ← backbone + decoder 梯度 (RSC 正则化)
+      + β · L_cons                     ← 一致性约束
+      + γ · (L_div + L_temp + L_input) ← 反塌陷正则化
+      + δ · L_action                   ← 动作分类辅助任务
+
+    v7.1 梯度流说明:
+      clean 路径和 masked 路径的梯度都会回传到 backbone (CSI Encoder +
+      Transformer). masked 路径之所以也能更新 backbone, 是因为
+      RSCGlobalChallenger 在 z_global_raw (保留计算图) 上做 mask,
+      未被遮挡的元素保留了完整的反向传播路径.
+
+    动作先验解耦:
+      forward_rsc 中以 50% 概率将 action_emb 置零 (Action Dropout),
+      迫使 decoder 不过度依赖动作标签, 提升跨域鲁棒性.
     """
 
-    def __init__(self, lambda1=1.0, lambda2=0.5, alpha=0.5, beta=2.0,
+    def __init__(self, lambda1=1.0, lambda2=0.5, lambda3=2.0, alpha=0.5, beta=2.0,
                  gamma=0.005, delta=0.02):
         super().__init__()
-        self.pose_loss = PoseLoss(lambda1, lambda2)
+        self.pose_loss = PoseLoss(lambda1, lambda2, lambda3)
         self.cons_loss = ConsistencyLoss()
         self.div_loss = DiversityLoss()
         self.temp_div_loss = TemporalDiversityLoss()
@@ -177,9 +228,11 @@ class TotalLoss(nn.Module):
         loss_dict = {}
 
         if training and 'p_final_masked' in outputs:
-            # Clean path: backbone + decoder receive gradients
+            # Clean path: backbone + decoder receive gradients (主损失)
             l_pose_clean, cd = self.pose_loss(outputs['p_final_clean'], gt)
-            # Masked path: only decoder receives gradients
+            # Masked path: backbone + decoder receive gradients (RSC 正则化)
+            # v7.1: z_global_masked 保留了 backbone 的计算图,
+            # 梯度经未遮挡元素回传到 Transformer 和 CSI Encoder
             l_pose_masked, md = self.pose_loss(outputs['p_final_masked'], gt)
             l_cons = self.cons_loss(outputs['p_final_clean'],
                                     outputs['p_final_masked'])
@@ -190,7 +243,6 @@ class TotalLoss(nn.Module):
             l_temp_div = self.temp_div_loss(pred_clean, gt)
             l_input_sens = self.input_sens_loss(pred_clean, gt)
 
-            # Clean is PRIMARY (backbone gradients), masked is secondary
             total = (l_pose_clean
                      + self.alpha * l_pose_masked
                      + self.beta * l_cons
@@ -209,7 +261,9 @@ class TotalLoss(nn.Module):
                 'l_input_sens': l_input_sens.item(),
                 'l_action': action_loss.item() if action_loss is not None else 0,
                 'l_coord_clean': cd['l_coord'],
+                'l_motion_clean': cd['l_motion'],
                 'l_coord_masked': md['l_coord'],
+                'l_motion_masked': md['l_motion'],
                 'l_bone_masked': md['l_bone'],
                 'l_vel_masked': md['l_vel'],
             })

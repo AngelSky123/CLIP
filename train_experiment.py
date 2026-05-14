@@ -126,7 +126,10 @@ class MMFiExperimentDataset(Dataset):
                             'csi_dir': csi_dir, 'gt_path': gt_path,
                         })
                     else:
-                        for start in range(0, num_frames - seq_len + 1, stride):
+                        starts = list(range(0, num_frames - seq_len + 1, stride))
+                        if starts and starts[-1] + seq_len < num_frames:
+                            starts.append(num_frames - seq_len)
+                        for start in starts:
                             self.samples.append({
                                 'env': env, 'subject': subj_str, 'action': act_str,
                                 'start_frame': start, 'num_frames': num_frames,
@@ -155,16 +158,16 @@ class MMFiExperimentDataset(Dataset):
         csi = self.preprocessor.preprocess(np.stack(amps), np.stack(phases))
         gt = np.load(sample['gt_path']).astype(np.float32)
         gt_clip = gt[start:start + actual_len]
-        gt_rel = gt_clip - gt_clip[:, 0:1, :]
+        # 绝对坐标 (DT-Pose 对齐)
 
         if actual_len < self.seq_len:
             pad = self.seq_len - actual_len
             csi = np.pad(csi, ((0, pad), (0, 0), (0, 0), (0, 0)), mode='edge')
-            gt_rel = np.pad(gt_rel, ((0, pad), (0, 0), (0, 0)), mode='edge')
+            gt_clip = np.pad(gt_clip, ((0, pad), (0, 0), (0, 0)), mode='edge')
 
         return {
             'csi': torch.from_numpy(csi),
-            'pose_3d': torch.from_numpy(gt_rel),
+            'pose_3d': torch.from_numpy(gt_clip),
             'env': sample['env'],
             'subject': sample['subject'],
             'action': sample['action'],
@@ -224,7 +227,7 @@ def build_dataloaders(data_root, setting, protocol, batch_size=2,
         data_root, train_envs, train_subs, action_ids, seq_len=seq_len
     )
     test_dataset = MMFiExperimentDataset(
-        data_root, test_envs, test_subs, action_ids, seq_len=seq_len
+        data_root, test_envs, test_subs, action_ids, seq_len=seq_len, stride=seq_len
     )
 
     # For S1, do sequence-level random split (same subjects in both)
@@ -401,7 +404,7 @@ def run_single_experiment(args):
     logger.info(f'Model parameters: {count_parameters(model):,}')
 
     # Training setup
-    loss_fn = PoseLoss(lambda1=1.0, lambda2=0.5)
+    loss_fn = PoseLoss(lambda1=1.0, lambda2=0.5, lambda3=2.0)
     evaluator = PoseEvaluator(unit='meter')
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -426,7 +429,7 @@ def run_single_experiment(args):
             logger.info(
                 f'[Epoch {epoch:3d}] Loss: {train_loss:.4f} | '
                 f'MPJPE: {cur:.2f} PA: {metrics["PA-MPJPE (mm)"]:.2f} '
-                f'P50: {metrics["PCK@50 (%)"]:.1f} P20: {metrics["PCK@20 (%)"]:.1f}'
+                f'P50: {metrics["PCK@50_norm (%)"]:.1f} P20: {metrics["PCK@20_norm (%)"]:.1f}'
             )
             if cur < best_mpjpe:
                 best_mpjpe = cur
@@ -496,7 +499,7 @@ def main():
         # Compute average
         if results:
             avg = {}
-            for key in ['MPJPE (mm)', 'PA-MPJPE (mm)', 'PCK@50 (%)', 'PCK@20 (%)']:
+            for key in ['MPJPE (mm)', 'PA-MPJPE (mm)', 'PCK@50_norm (%)', 'PCK@20_norm (%)']:
                 vals = [r[key] for r in results if key in r]
                 avg[key] = np.mean(vals) if vals else 0
             print(f'\n{"="*60}')

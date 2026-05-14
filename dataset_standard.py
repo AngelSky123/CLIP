@@ -110,7 +110,10 @@ class MMFiStandardDataset(Dataset):
                             'csi_dir': csi_dir, 'gt_path': gt_path,
                         })
                     else:
-                        for start in range(0, num_frames - self.seq_len + 1, self.stride):
+                        starts = list(range(0, num_frames - self.seq_len + 1, self.stride))
+                        if starts and starts[-1] + self.seq_len < num_frames:
+                            starts.append(num_frames - self.seq_len)
+                        for start in starts:
                             self.samples.append({
                                 'env': env, 'subject': subj_str, 'action': act_str,
                                 'start_frame': start, 'num_frames': num_frames,
@@ -149,16 +152,15 @@ class MMFiStandardDataset(Dataset):
 
         gt = np.load(sample['gt_path']).astype(np.float32)
         gt_clip = gt[start:start + actual_len]
-        root = gt_clip[:, 0:1, :]
-        gt_clip_rel = gt_clip - root
 
+        # 绝对坐标 (DT-Pose 对齐)
         if actual_len < self.seq_len:
             pad_len = self.seq_len - actual_len
             csi = np.pad(csi, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
-            gt_clip_rel = np.pad(gt_clip_rel, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
+            gt_clip = np.pad(gt_clip, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
 
         csi_tensor = torch.from_numpy(csi)
-        gt_tensor = torch.from_numpy(gt_clip_rel)
+        gt_tensor = torch.from_numpy(gt_clip)
 
         if self.augmentor is not None:
             csi_tensor = self.augmentor(csi_tensor)
@@ -221,7 +223,7 @@ def build_dataloaders(args):
     )
     test_dataset = MMFiStandardDataset(
         args.data_root, args.all_envs, test_ids,
-        seq_len=args.seq_len, augment=False,
+        seq_len=args.seq_len, stride=args.seq_len, augment=False,
     )
 
     train_loader = DataLoader(

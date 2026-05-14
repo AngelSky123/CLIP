@@ -112,8 +112,8 @@ def evaluate(model, test_loader, device, evaluator, logger):
     logger.info(
         f'[Eval] MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
         f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
-        f'P50: {metrics["PCK@50 (%)"]:.1f}% | '
-        f'P20: {metrics["PCK@20 (%)"]:.1f}% | '
+        f'P50: {metrics["PCK@50_norm (%)"]:.1f}% | '
+        f'P20: {metrics["PCK@20_norm (%)"]:.1f}% | '
         f'PredStd: {pred_std:.1f}mm | '
         f'ActAcc: {action_acc:.1f}%'
     )
@@ -148,7 +148,7 @@ def main():
     model = CSIRSCPoseDG(args).to(device)
     logger.info(f'Parameters: {count_parameters(model):,}')
 
-    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2)
+    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2, lambda3=getattr(args, "lambda3", 2.0))
     evaluator = PoseEvaluator(unit='meter')
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)

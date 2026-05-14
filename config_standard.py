@@ -1,5 +1,6 @@
 """
-CSI-RSC-PoseDG 配置文件 — 标准 8:2 划分模式
+CSI-RSC-PoseDG 配置文件 — 标准 8:2 划分模式 v2.1
+- 修复: parse_args([]) → parse_args() 以接受命令行参数
 整体数据集按 8:2 划分, 不区分环境, 测试模型整体性能.
 """
 import argparse
@@ -58,6 +59,8 @@ def get_config(inference_only=False):
     # ======================== Loss ========================
     parser.add_argument('--lambda1', type=float, default=1.0)
     parser.add_argument('--lambda2', type=float, default=0.5)
+    parser.add_argument('--lambda3', type=float, default=2.0,
+                        help='Weight for MotionGuidanceLoss (anti temporal collapse)')
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--beta', type=float, default=2.0)
     parser.add_argument('--gamma', type=float, default=0.0,
@@ -74,7 +77,7 @@ def get_config(inference_only=False):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--accumulate_grad', type=int, default=4)
+    parser.add_argument('--accumulate_grad', '--accum', type=int, default=4)
     parser.add_argument('--patience', type=int, default=15)
 
     # ======================== Logging ========================
@@ -82,7 +85,15 @@ def get_config(inference_only=False):
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--eval_interval', type=int, default=3)
 
-    args = parser.parse_args([])
+    # ======================== Parse ========================
+    # v2.1 修复: parse_args([]) → parse_known_args()
+    if inference_only:
+        args = parser.parse_args([])
+    else:
+        args, unknown = parser.parse_known_args()
+        if unknown:
+            import warnings
+            warnings.warn(f"Ignoring unrecognized arguments: {unknown}")
 
     if not inference_only:
         from datetime import datetime

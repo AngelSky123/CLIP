@@ -126,17 +126,15 @@ class MMFiDataset(Dataset):
         gt = np.load(sample['gt_path']).astype(np.float32)
         gt_clip = gt[start:start + actual_len]
 
-        # Root-relative coordinates
-        root = gt_clip[:, 0:1, :]
-        gt_clip_rel = gt_clip - root
-
+        # 绝对坐标 (DT-Pose 对齐, 不减 root)
+        # 注: 原 Root-relative 代码已删除
         if actual_len < self.seq_len:
             pad_len = self.seq_len - actual_len
             csi = np.pad(csi, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
-            gt_clip_rel = np.pad(gt_clip_rel, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
+            gt_clip = np.pad(gt_clip, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
 
         csi_tensor = torch.from_numpy(csi)
-        gt_tensor = torch.from_numpy(gt_clip_rel)
+        gt_tensor = torch.from_numpy(gt_clip)
 
         # Apply CSI augmentation
         if self.augmentor is not None:
@@ -182,7 +180,8 @@ def build_dataloaders(args, synthetic=False):
         )
         test_dataset = MMFiDataset(
             args.data_root, [args.test_env], args.seq_len,
-            augment=False,  # No augmentation for testing
+            stride=args.seq_len,  # 无重叠滑窗: 每帧评测一次 (DT-Pose 对齐)
+            augment=False,
         )
 
     train_loader = DataLoader(
