@@ -173,8 +173,10 @@ def main():
         lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3,
         alpha=args.alpha, beta=args.beta,
         gamma=args.gamma, delta=args.delta,
+        lambda_hip=getattr(args, 'lambda_hip', 1.0),
     )
-    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3)
+    pose_loss_fn = PoseLoss(lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3,
+                             lambda_hip=getattr(args, 'lambda_hip', 1.0))
     evaluator = PoseEvaluator(unit='meter')
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

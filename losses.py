@@ -30,6 +30,26 @@ class CoordinateLoss(nn.Module):
         return dist.mean()
 
 
+class HipPositionLoss(nn.Module):
+    """专门惩罚 hip (joint 0) 的全局位置预测误差.
+
+    CSI 信号原则上能编码人在房间里的位置 (多径效应), 但模型对此学得很慢.
+    通过显式加权 hip 关节的回归损失, 引导模型更专注全局定位预测.
+
+    使用方式: pose_loss = base_loss + lambda_hip * HipPositionLoss
+    建议起始权重 1.0, 如果 PA-MPJPE 显著上升说明姿态质量被挤压, 降到 0.5.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, gt):
+        hip_pred = pred[:, :, 0, :]  # (B, T, 3)
+        hip_gt = gt[:, :, 0, :]
+        return torch.norm(hip_pred - hip_gt, dim=-1).mean()
+
+
+
 class BoneConsistencyLoss(nn.Module):
     def __init__(self, bones=None):
         super().__init__()
@@ -164,30 +184,35 @@ class InputSensitivityLoss(nn.Module):
 
 
 class PoseLoss(nn.Module):
-    def __init__(self, lambda1=1.0, lambda2=0.5, lambda3=2.0):
+    def __init__(self, lambda1=1.0, lambda2=0.5, lambda3=2.0, lambda_hip=1.0):
         super().__init__()
         self.coord_loss = CoordinateLoss()
         self.bone_loss = BoneConsistencyLoss()
         self.vel_loss = VelocitySmoothLoss()
         self.motion_guidance = MotionGuidanceLoss()
+        self.hip_loss = HipPositionLoss()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
+        self.lambda_hip = lambda_hip
 
     def forward(self, pred, gt):
         l_coord = self.coord_loss(pred, gt)
         l_bone = self.bone_loss(pred, gt)
         l_vel = self.vel_loss(pred, gt)
         l_motion = self.motion_guidance(pred, gt)
+        l_hip = self.hip_loss(pred, gt)
         total = (l_coord
                  + self.lambda1 * l_bone
                  + self.lambda2 * l_vel
-                 + self.lambda3 * l_motion)
+                 + self.lambda3 * l_motion
+                 + self.lambda_hip * l_hip)
         return total, {
             'l_coord': l_coord.item(),
             'l_bone': l_bone.item(),
             'l_vel': l_vel.item(),
             'l_motion': l_motion.item(),
+            'l_hip': l_hip.item(),
         }
 
 
@@ -212,9 +237,9 @@ class TotalLoss(nn.Module):
     """
 
     def __init__(self, lambda1=1.0, lambda2=0.5, lambda3=2.0, alpha=0.5, beta=2.0,
-                 gamma=0.005, delta=0.02):
+                 gamma=0.005, delta=0.02, lambda_hip=1.0):
         super().__init__()
-        self.pose_loss = PoseLoss(lambda1, lambda2, lambda3)
+        self.pose_loss = PoseLoss(lambda1, lambda2, lambda3, lambda_hip)
         self.cons_loss = ConsistencyLoss()
         self.div_loss = DiversityLoss()
         self.temp_div_loss = TemporalDiversityLoss()

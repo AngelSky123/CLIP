@@ -50,7 +50,7 @@ def get_config(inference_only=False):
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--tcn_channels', type=list, default=[128, 128])
     parser.add_argument('--tcn_kernel_size', type=int, default=3)
-    parser.add_argument('--transformer_dropout', type=float, default=0.1)
+    parser.add_argument('--transformer_dropout', type=float, default=0.3)
 
     # ======================== RSC-II (stronger) ========================
     parser.add_argument('--rsc2_time_drop_pct', type=float, default=0.5)
@@ -67,6 +67,8 @@ def get_config(inference_only=False):
     parser.add_argument('--lambda2', type=float, default=0.5)
     parser.add_argument('--lambda3', type=float, default=2.0,
                         help='Weight for MotionGuidanceLoss (anti temporal collapse)')
+    parser.add_argument('--lambda_hip', type=float, default=1.0,
+                        help='Weight for HipPositionLoss (improve global hip prediction)')
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--beta', type=float, default=2.0,
                         help='Increased consistency weight for stronger RSC')
@@ -79,7 +81,7 @@ def get_config(inference_only=False):
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-3)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)

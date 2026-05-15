@@ -144,16 +144,15 @@ def load_single_sample(data_root, env, subject, action, start_frame=0, seq_len=6
 
     gt = np.load(gt_path).astype(np.float32)
     gt_clip = gt[start_frame:start_frame + actual_len]
-    root = gt_clip[:, 0:1, :]
-    gt_rel = gt_clip - root
+    # 绝对坐标 (与 dataset.py 一致, 不再做 root 减法)
 
     if actual_len < seq_len:
         pad_len = seq_len - actual_len
         csi = np.pad(csi, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
-        gt_rel = np.pad(gt_rel, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
+        gt_clip = np.pad(gt_clip, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
 
     csi_tensor = torch.from_numpy(csi).unsqueeze(0)
-    gt_tensor = torch.from_numpy(gt_rel).unsqueeze(0)
+    gt_tensor = torch.from_numpy(gt_clip).unsqueeze(0)
     return csi_tensor, gt_tensor, actual_len
 
 
