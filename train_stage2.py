@@ -64,14 +64,7 @@ def parse_stage2_extras():
 def load_pretrained_backbone(model, ckpt_path, logger, device):
     """Load Stage 1A or 1B checkpoint into CSIRSCPoseDG's backbone submodules.
 
-    CSIRSCPoseDG (from models/full_model.py) has:
-      - self.csi_encoder
-      - self.local_encoder
-      - self.feature_pooling   (now HMSF after the patch)
-      - self.global_modeler
-      - self.pose_decoder       (fresh)
-      - self.action_classifier  (optionally seeded from Stage 1B)
-      - self.rsc_global         (fresh, no params actually)
+    FIX 🔴 #3: now warns on key mismatch and aborts if essentially random init.
     """
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Pretrain ckpt not found: {ckpt_path}')
@@ -81,22 +74,47 @@ def load_pretrained_backbone(model, ckpt_path, logger, device):
     logger.info(f'Pretrain ckpt keys: {keys}')
 
     loaded = []
+    failed = []
     for name in ['csi_encoder', 'local_encoder', 'feature_pooling', 'global_modeler']:
         if name in sd:
             m, u = getattr(model, name).load_state_dict(sd[name], strict=False)
             logger.info(f'  {name}: missing={len(m)} unexpected={len(u)}')
+
+            if len(m) > 0 or len(u) > 0:
+                logger.warning(
+                    f'  ⚠ {name} KEY MISMATCH! '
+                    f'missing[:5]={m[:5]}, unexpected[:5]={u[:5]}'
+                )
+                expected_keys = len(getattr(model, name).state_dict())
+                load_ratio = (expected_keys - len(m)) / max(expected_keys, 1)
+                if load_ratio < 0.5:
+                    logger.error(
+                        f'  ❌ {name} loaded only {load_ratio*100:.1f}% of expected params! '
+                        f'This is essentially random init.'
+                    )
+                    failed.append(name)
             loaded.append(name)
 
-    # If Stage 1B, also seed action_classifier
+    # Stage 1B 的 action_classifier（如果 ckpt 里有的话）
     if 'action_classifier' in sd:
         try:
             m, u = model.action_classifier.load_state_dict(
                 sd['action_classifier'], strict=False)
             logger.info(f'  action_classifier (from Stage 1B): '
                         f'missing={len(m)} unexpected={len(u)}')
+            if len(m) > 0 or len(u) > 0:
+                logger.warning(
+                    f'  ⚠ action_classifier mismatch! '
+                    f'missing[:5]={m[:5]}, unexpected[:5]={u[:5]}'
+                )
             loaded.append('action_classifier')
         except Exception as e:
             logger.warning(f'action_classifier load failed: {e}')
+
+    if failed:
+        logger.error(f'❌ ABORTED: modules failed to load: {failed}')
+        logger.error(f'   Stage 2 would essentially train from random weights for these modules.')
+        raise RuntimeError(f'Backbone loading failed for: {failed}')
 
     logger.info(f'Loaded pretrained components: {loaded}')
 

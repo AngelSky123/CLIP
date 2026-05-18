@@ -39,7 +39,7 @@ def get_config(inference_only=False):
     parser.add_argument('--global_dim', type=int, default=128)
     parser.add_argument('--num_transformer_layers', type=int, default=3)
     parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--tcn_channels', type=list, default=[128, 128])
+    parser.add_argument('--tcn_channels', type=int, nargs='+', default=[128, 128])
     parser.add_argument('--tcn_kernel_size', type=int, default=3)
     parser.add_argument('--transformer_dropout', type=float, default=0.1)
     parser.add_argument('--coarse_hidden_dim', type=int, default=256)

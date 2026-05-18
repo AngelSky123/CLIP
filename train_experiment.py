@@ -1,7 +1,12 @@
 """
-CSI-RSC-PoseDG: 统一实验脚本
+CSI-RSC-PoseDG: 统一实验脚本 (FIXED v2)
 
-支持 3 种协议 × 3 种划分设定的任意组合.
+修复内容（基于 code review 报告）：
+  🔴 #2: train_one_epoch 现在使用 forward_rsc + 完整 TotalLoss，启用 RSC
+  🟡 #7: best_epoch 正确写入 results.json
+  🟡 #12: S1 模式下不再重复构建 test_dataset
+
+支持 3 种协议 × 3 种划分设定的任意组合。
 
 协议:
   P1: A01-A14 (14 类日常动作)
@@ -36,7 +41,7 @@ from scipy.signal import detrend
 from datetime import datetime
 
 from models.full_model import CSIRSCPoseDG
-from losses import PoseLoss
+from losses import TotalLoss, PoseLoss  # FIX 🔴 #2: now imports both
 from evaluate import PoseEvaluator
 from utils import set_seed, setup_logger, count_parameters, save_checkpoint, AverageMeter, Timer
 
@@ -178,17 +183,13 @@ class MMFiExperimentDataset(Dataset):
 # Data splitting logic
 # ==============================================================
 def build_splits(setting, protocol, seed=42, test_env=None):
-    """Return (train_envs, train_subjects, test_envs, test_subjects).
-
-    All subjects are returned as sets of integer IDs.
-    """
+    """Return (train_envs, train_subjects, test_envs, test_subjects)."""
     action_ids = PROTOCOLS[protocol]
     all_subjects = set(range(1, 41))
     rng = np.random.RandomState(seed)
 
     if setting == 'S1':
         # Random 3:1 split — ALL subjects in both train and test
-        # Splitting happens at sequence level in build_dataloaders
         return ALL_ENVS, all_subjects, ALL_ENVS, all_subjects
 
     elif setting == 'S2':
@@ -218,21 +219,17 @@ def build_splits(setting, protocol, seed=42, test_env=None):
 
 def build_dataloaders(data_root, setting, protocol, batch_size=2,
                       num_workers=4, seed=42, test_env=None, seq_len=64):
+    """FIX 🟡 #12: S1 mode no longer builds test_dataset redundantly."""
     action_ids = PROTOCOLS[protocol]
     train_envs, train_subs, test_envs, test_subs = build_splits(
         setting, protocol, seed, test_env
     )
 
-    train_dataset = MMFiExperimentDataset(
-        data_root, train_envs, train_subs, action_ids, seq_len=seq_len
-    )
-    test_dataset = MMFiExperimentDataset(
-        data_root, test_envs, test_subs, action_ids, seq_len=seq_len, stride=seq_len
-    )
-
-    # For S1, do sequence-level random split (same subjects in both)
     if setting == 'S1':
-        full_dataset = train_dataset  # both have same subjects
+        # FIX: only scan disk once, then random split via Subset
+        full_dataset = MMFiExperimentDataset(
+            data_root, train_envs, train_subs, action_ids, seq_len=seq_len
+        )
         n_total = len(full_dataset)
         indices = np.random.RandomState(seed).permutation(n_total).tolist()
         n_train = int(n_total * 0.75)
@@ -240,7 +237,16 @@ def build_dataloaders(data_root, setting, protocol, batch_size=2,
         test_idx = indices[n_train:]
         train_dataset = Subset(full_dataset, train_idx)
         test_dataset = Subset(full_dataset, test_idx)
-        train_subs = set(range(1, 41))  # all subjects in both
+        train_subs = set(range(1, 41))
+    else:
+        # S2 / S3: train and test subjects are different subsets, build separately
+        train_dataset = MMFiExperimentDataset(
+            data_root, train_envs, train_subs, action_ids, seq_len=seq_len
+        )
+        test_dataset = MMFiExperimentDataset(
+            data_root, test_envs, test_subs, action_ids,
+            seq_len=seq_len, stride=seq_len  # test uses non-overlapping windows
+        )
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -282,6 +288,7 @@ def get_model_args(num_actions=27):
     a.seq_len = 64
     # RSC params
     a.rsc2_time_drop_pct = 0.5
+    a.rsc2_channel_drop_pct = 0.5
     a.rsc2_batch_pct = 0.5
     return a
 
@@ -289,9 +296,22 @@ def get_model_args(num_actions=27):
 # ==============================================================
 # Training & Evaluation
 # ==============================================================
-def train_one_epoch(model, loader, optimizer, loss_fn, device, grad_clip=1.0, accum=4):
+def train_one_epoch(model, loader, optimizer, total_loss_fn, pose_loss_fn,
+                    device, grad_clip=1.0, accum=4):
+    """
+    FIX 🔴 #2: Train one epoch using forward_rsc (with RSC + Action Dropout).
+
+    Signature changed from 4-arg version:
+        OLD: (model, loader, optimizer, loss_fn, device, ...)
+        NEW: (model, loader, optimizer, total_loss_fn, pose_loss_fn, device, ...)
+
+    The model now goes through forward_rsc to get both clean and masked
+    pose predictions, then TotalLoss computes the full domain generalization
+    objective (clean pose + RSC-masked pose + consistency + action).
+    """
     model.train()
     loss_meter = AverageMeter()
+    action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
 
     for i, batch in enumerate(loader):
@@ -300,15 +320,26 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, grad_clip=1.0, ac
 
         action_labels = torch.tensor(
             [int(a[1:]) - 1 for a in batch['action']],
-            dtype=torch.long, device=device
+            dtype=torch.long, device=device,
         )
-        out = model(csi, action_idx=action_labels)
-        loss, _ = loss_fn(out['p_final'], pose)
-        # Action classification loss
-        act_loss = nn.CrossEntropyLoss()(out['action_logits'], action_labels)
-        loss = loss + 0.5 * act_loss
-        loss = loss / accum
-        loss.backward()
+
+        # === KEY FIX: use forward_rsc instead of plain forward ===
+        # This enables RSC masking, Action Dropout (50% prob), and produces
+        # both clean and masked predictions needed by TotalLoss.
+        outputs = model.forward_rsc(
+            csi, pose,
+            loss_fn=lambda p, g: pose_loss_fn(p, g)[0],
+            action_idx=action_labels,
+        )
+
+        # Action classification auxiliary loss
+        action_loss = action_loss_fn(outputs['action_logits'], action_labels)
+
+        # Full domain-generalization loss:
+        # = L_pose(clean) + α·L_pose(masked) + β·L_cons + γ·anti_collapse + δ·L_action
+        loss, _ = total_loss_fn(outputs, pose, training=True, action_loss=action_loss)
+
+        (loss / accum).backward()
 
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
             if grad_clip > 0:
@@ -316,8 +347,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, grad_clip=1.0, ac
             optimizer.step()
             optimizer.zero_grad()
 
-        loss_meter.update(loss.item() * accum, csi.shape[0])
-        del out, loss, csi, pose
+        loss_meter.update(loss.item(), csi.shape[0])
+        del outputs, loss, csi, pose
         torch.cuda.empty_cache()
 
     return loss_meter.avg
@@ -339,7 +370,6 @@ def evaluate(model, loader, device, evaluator):
         all_preds.append(out['p_final'].cpu())
         all_gts.append(pose.cpu())
 
-        # 动作准确率 (仅指标, 不作为模型输入)
         action_labels = torch.tensor(
             [int(a[1:]) - 1 for a in batch['action']],
             dtype=torch.long, device=device
@@ -377,13 +407,11 @@ def run_single_experiment(args):
     logger.info(f'Setting: {args.setting}')
     if args.test_env:
         logger.info(f'Test env: {args.test_env}')
+    logger.info(f'✓ Using forward_rsc (RSC + Action Dropout enabled)')
 
     # Data
-    # IMPORTANT: Always use 27 (full action space) for the embedding table.
+    # Always use 27 (full action space) for the embedding table.
     # Protocol only controls which actions appear in the data, not the index range.
-    # P1: data has A01-A14 (idx 0-13), P2: A15-A27 (idx 14-26), P3: all.
-    # Using len(PROTOCOLS[protocol]) would create a 13-slot table for P2,
-    # but action indices are still 14-26 → out-of-bounds crash.
     num_actions = 27
     train_loader, test_loader, train_subs, test_subs = build_dataloaders(
         args.data_root, args.setting, args.protocol,
@@ -403,8 +431,16 @@ def run_single_experiment(args):
     model = CSIRSCPoseDG(model_args).to(device)
     logger.info(f'Model parameters: {count_parameters(model):,}')
 
-    # Training setup
-    loss_fn = PoseLoss(lambda1=1.0, lambda2=0.5, lambda3=2.0)
+    # FIX 🔴 #2: build both PoseLoss (for pose-only loss inside forward_rsc)
+    # and TotalLoss (for the full training objective).
+    pose_loss_fn = PoseLoss(
+        lambda1=1.0, lambda2=0.5, lambda3=2.0, lambda_hip=1.0,
+    )
+    total_loss_fn = TotalLoss(
+        lambda1=1.0, lambda2=0.5, lambda3=2.0,
+        alpha=0.5, beta=2.0, gamma=0.0, delta=0.5,
+        lambda_hip=1.0,
+    )
     evaluator = PoseEvaluator(unit='meter')
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -417,9 +453,11 @@ def run_single_experiment(args):
     best_metrics = {}
 
     for epoch in range(1, args.epochs + 1):
+        # FIX 🔴 #2: pass both loss functions
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device,
-            grad_clip=1.0, accum=args.accum
+            model, train_loader, optimizer,
+            total_loss_fn, pose_loss_fn,
+            device, grad_clip=1.0, accum=args.accum
         )
         scheduler.step()
 
@@ -433,6 +471,8 @@ def run_single_experiment(args):
             )
             if cur < best_mpjpe:
                 best_mpjpe = cur
+                # FIX 🟡 #7: record epoch in best_metrics so results.json has best_epoch
+                metrics['epoch'] = epoch
                 best_metrics = metrics.copy()
                 patience_counter = 0
                 save_checkpoint(model, optimizer, epoch, metrics,
@@ -443,7 +483,11 @@ def run_single_experiment(args):
                 logger.info(f'Early stopping at epoch {epoch}')
                 break
 
-    logger.info(f'Best MPJPE: {best_mpjpe:.2f}mm | Time: {timer.elapsed_str()}')
+    logger.info(
+        f'Best MPJPE: {best_mpjpe:.2f}mm | '
+        f'Best Epoch: {best_metrics.get("epoch", "?")} | '
+        f'Time: {timer.elapsed_str()}'
+    )
 
     # Save results
     result = {
@@ -452,7 +496,7 @@ def run_single_experiment(args):
         'test_env': args.test_env,
         'n_train': len(train_loader.dataset),
         'n_test': len(test_loader.dataset),
-        'best_epoch': best_metrics.get('epoch', '?'),
+        'best_epoch': best_metrics.get('epoch', '?'),  # FIX 🟡 #7
         **best_metrics,
     }
     with open(os.path.join(save_dir, 'results.json'), 'w') as f:
