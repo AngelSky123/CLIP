@@ -1,9 +1,18 @@
 """
 CSI-RSC-PoseDG v7.1 — Action-Conditioned Pose Decoder (Fixed)
+  + v8.x: optional ImageNet vision backbone front-end (use_vision_backbone).
 
 核心修正:
 1. 修复计算图断裂 (Detach Bug): 真正启用 RSCGlobalChallenger，确保 Mask 操作保留 Backbone 梯度。
 2. 动作特征随机失活 (Action Dropout): 训练时 50% 概率阻断 Action 先验，彻底解决跨域时的级联失效。
+
+NEW — Vision backbone option:
+  If args.use_vision_backbone is True, the (csi_encoder + local_encoder +
+  feature_pooling) trio is replaced by a single VisionBackboneEncoder that maps
+  each CSI frame (9,114,10) through an ImageNet-pretrained backbone and outputs a
+  per-frame feature sequence (B, T, global_dim). GlobalTemporalModeler, RSC,
+  PoseDecoder, ActionClassifier and BOTH forward paths are unchanged.
+  Default is False -> identical behaviour to the original model.
 """
 import torch
 import torch.nn as nn
@@ -15,7 +24,7 @@ from .global_encoder import GlobalTemporalModeler
 from .pose_decoder import PoseDecoder, ActionClassifier
 
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
-from .rsc import RSCGlobalChallenger 
+from .rsc import RSCGlobalChallenger
 
 
 class CSIRSCPoseDG(nn.Module):
@@ -26,23 +35,43 @@ class CSIRSCPoseDG(nn.Module):
 
         action_embed_dim = 32
 
-        # ------ 初始化 Backbone ------
-        self.csi_encoder = DualBranchCSIEncoder(
-            amp_channels=args.amp_channels,
-            phase_channels=args.phase_channels,
-            hidden_dim=args.encoder_hidden_dim,
-            out_dim=args.encoder_out_dim,
-        )
-        self.local_encoder = LocalSpatioTemporalEncoder(
-            in_channels=args.encoder_out_dim,
-            hidden_dim=args.local_hidden_dim,
-            out_dim=args.local_out_dim,
-            num_blocks=args.num_res3d_blocks,
-        )
-        self.feature_pooling = LocalFeaturePooling(
-            in_channels=args.local_out_dim,
-            out_channels=args.global_dim,
-        )
+        # ------ NEW: choose front-end (original CSI trio vs vision backbone) ------
+        self.use_vision_backbone = getattr(args, 'use_vision_backbone', False)
+
+        if self.use_vision_backbone:
+            # Lazy import so non-vision users don't need timm installed.
+            from .vision_backbone import VisionBackboneEncoder
+            self.vision_backbone = VisionBackboneEncoder(
+                in_channels=getattr(args, 'vision_in_channels',
+                                    args.amp_channels + args.phase_channels),
+                out_dim=args.global_dim,                 # MUST equal global_modeler in_dim
+                arch=getattr(args, 'vision_arch', 'resnet18'),
+                pretrained=not getattr(args, 'vision_scratch', False),
+                img_size=getattr(args, 'vision_img_size', 112),
+                instance_norm=not getattr(args, 'vision_no_instance_norm', False),
+                freeze_backbone=getattr(args, 'vision_freeze', False),
+                weights_path=getattr(args, 'vision_weights', None),
+            )
+        else:
+            # ------ 原始 Backbone ------
+            self.csi_encoder = DualBranchCSIEncoder(
+                amp_channels=args.amp_channels,
+                phase_channels=args.phase_channels,
+                hidden_dim=args.encoder_hidden_dim,
+                out_dim=args.encoder_out_dim,
+            )
+            self.local_encoder = LocalSpatioTemporalEncoder(
+                in_channels=args.encoder_out_dim,
+                hidden_dim=args.local_hidden_dim,
+                out_dim=args.local_out_dim,
+                num_blocks=args.num_res3d_blocks,
+            )
+            self.feature_pooling = LocalFeaturePooling(
+                in_channels=args.local_out_dim,
+                out_channels=args.global_dim,
+            )
+
+        # ------ 全局时序建模器 (always present, unchanged) ------
         self.global_modeler = GlobalTemporalModeler(
             in_dim=args.global_dim,
             global_dim=args.global_dim,
@@ -77,6 +106,14 @@ class CSIRSCPoseDG(nn.Module):
         )
 
     def forward_backbone(self, csi):
+        if self.use_vision_backbone:
+            # Vision path: per-frame ImageNet features -> temporal model.
+            z_seq = self.vision_backbone(csi)          # (B, T, global_dim)
+            z_global = self.global_modeler(z_seq)
+            # z_local is unused by losses/RSC downstream; return z_seq as a
+            # harmless placeholder to keep the (z_local, z_global) contract.
+            return z_seq, z_global
+
         feat = self.csi_encoder(csi)
         z_local = self.local_encoder(feat)
         z_pooled = self.feature_pooling(z_local)
@@ -92,12 +129,10 @@ class CSIRSCPoseDG(nn.Module):
         action_logits = self.action_classifier(z_global)
 
         if action_idx is not None:
-            # Training / Oracle: use GT action
             action_emb = self.action_classifier.get_action_embedding(
                 action_idx=action_idx
             )
         else:
-            # Inference: use predicted action (soft)
             action_probs = F.softmax(action_logits, dim=-1)
             action_emb = self.action_classifier.get_action_embedding(
                 action_probs=action_probs
@@ -127,9 +162,6 @@ class CSIRSCPoseDG(nn.Module):
             action_emb = self.action_classifier.get_action_embedding(action_probs=action_probs)
 
         # === 修复 2：Action Dropout (动作特征解耦) ===
-        # 训练时以 50% 概率将动作先验置零。
-        # 这迫使 Decoder 必须学会仅通过 CSI 骨干特征来推演 3D 骨架，
-        # 防止其过度依赖 Action 导致在未知域彻底崩盘。
         if self.training and torch.rand(1).item() < 0.5:
             action_emb_for_decoder = torch.zeros_like(action_emb)
         else:
@@ -152,10 +184,7 @@ class CSIRSCPoseDG(nn.Module):
             create_graph=False, retain_graph=False,
         )[0]
 
-        # Step 4: RSC Masking (特征自挑战应用)
-        # === 修复 1：保留 Backbone 梯度 ===
-        # 传入带有 requires_grad=True 的 z_global_raw，
-        # Mask 后的张量将会把惩罚梯度一路反传回 Transformer 和 CSI Encoder。
+        # Step 4: RSC Masking (特征自挑战应用) — 保留 Backbone 梯度
         z_global_masked = self.rsc_global(
             z_global_raw, grad_global.detach()
         )

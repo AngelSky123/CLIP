@@ -1,15 +1,20 @@
 """
-单样本测试可视化脚本 v2 — 修复坐标轴映射
+单样本测试可视化脚本 v3 — 支持 vision(图像渲染)权重
 
 MMFi/H36M 坐标系: dim0=X(左右), dim1=Y(身高/垂直), dim2=Z(前后/深度)
 Matplotlib 3D:    X轴=左右, Y轴=前后, Z轴=垂直
-
 映射: plot_X=data_X, plot_Y=data_Z, plot_Z=data_Y
 
 用法:
+  # 原始 CSI baseline 权重 (默认, 无需 --vision)
   python visualize.py --checkpoint checkpoints/best_model.pth \
-                      --env E04 --subject S31 --action A01 \
-                      --frame 50 --save_dir viz_output
+                      --env E04 --subject S31 --action A01 --frame 50
+
+  # 图像渲染 vision 权重 (加 --vision; img_size 要和训练时一致)
+  python visualize.py --checkpoint checkpoints/img_stage2_pose/run_xxx/best_model.pth \
+                      --env E04 --subject S32 --action A26 --frame 30 \
+                      --vision --vision_arch resnet18 --vision_img_size 112 \
+                      --save_dir viz_output_vision
 """
 import os
 import sys
@@ -29,6 +34,7 @@ from scipy.io import loadmat
 from config import get_config
 from models.full_model import CSIRSCPoseDG
 from dataset import CSIPreprocessor
+from csi_image import CSIImagePreprocessor          # vision 模式: CSI->渲染图
 from evaluate import mpjpe, pa_mpjpe, pck, pck_normalized
 
 
@@ -67,52 +73,38 @@ BONE_COLORS_PRED = {
 
 
 def detect_vertical_axis(joints):
-    """Auto-detect which axis is vertical and whether to flip.
-    
-    Args:
-        joints: (T, 17, 3) or (17, 3)
-    Returns:
-        axis_order: tuple (plot_x_idx, plot_y_idx, plot_z_idx)
-        flip_z: bool — True if vertical axis needs to be negated
-    """
     if joints.ndim == 3:
         j = joints[0]
     else:
         j = joints
-    
     hip_to_head = j[10] - j[0]
     vertical_axis = np.argmax(np.abs(hip_to_head))
-    
-    # If Hip->Head is negative along vertical axis, we need to flip
     flip_z = hip_to_head[vertical_axis] < 0
-    
     axes = [0, 1, 2]
     axes.remove(vertical_axis)
-    
     return (axes[0], axes[1], vertical_axis), flip_z
 
 
 def remap_joints(joints, axis_order, flip_z=False):
-    """Remap joint coordinates to plotting axes.
-    
-    Args:
-        joints: (..., 3)
-        axis_order: (x_idx, y_idx, z_idx)
-        flip_z: if True, negate the vertical axis (person upside down fix)
-    Returns:
-        remapped: (..., 3)
-    """
     x_idx, y_idx, z_idx = axis_order
     z_data = joints[..., z_idx]
     if flip_z:
         z_data = -z_data
-    return np.stack([joints[..., x_idx], 
-                     joints[..., y_idx], 
+    return np.stack([joints[..., x_idx],
+                     joints[..., y_idx],
                      z_data], axis=-1)
 
 
-def load_single_sample(data_root, env, subject, action, start_frame=0, seq_len=64):
-    """Load a single CSI sample and its ground truth."""
+def load_single_sample(data_root, env, subject, action, start_frame=0, seq_len=64,
+                       renderer=None):
+    """Load a single CSI sample and its GT.
+
+    Returns:
+        model_in_tensor: (1,T,9,114,10) raw CSI  OR  (1,T,3,H,W) rendered image (vision)
+        csi_tensor:      (1,T,9,114,10) raw CSI  (always — for CSI input heatmap viz)
+        gt_tensor:       (1,T,17,3)
+        actual_len
+    """
     csi_dir = os.path.join(data_root, env, subject, action, 'wifi-csi')
     gt_path = os.path.join(data_root, env, subject, action, 'ground_truth.npy')
 
@@ -138,9 +130,15 @@ def load_single_sample(data_root, env, subject, action, start_frame=0, seq_len=6
         amps.append(amp)
         phases.append(pha)
 
-    amp = np.stack(amps, axis=0)
+    amp = np.stack(amps, axis=0)        # (T,3,114,10)
     phase = np.stack(phases, axis=0)
-    csi = preprocessor.preprocess(amp, phase)
+    csi = preprocessor.preprocess(amp, phase)            # (T,9,114,10) 原始 CSI (输入可视化用)
+
+    # 模型输入: vision 模式渲染成 (T,3,H,W); 否则用 9 通道 CSI
+    if renderer is not None:
+        model_in = renderer.preprocess(amp, phase)       # (T,3,H,W)
+    else:
+        model_in = csi
 
     gt = np.load(gt_path).astype(np.float32)
     gt_clip = gt[start_frame:start_frame + actual_len]
@@ -149,34 +147,32 @@ def load_single_sample(data_root, env, subject, action, start_frame=0, seq_len=6
     if actual_len < seq_len:
         pad_len = seq_len - actual_len
         csi = np.pad(csi, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
+        model_in = np.pad(model_in, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
         gt_clip = np.pad(gt_clip, ((0, pad_len), (0, 0), (0, 0)), mode='edge')
 
+    model_in_tensor = torch.from_numpy(model_in).unsqueeze(0)
     csi_tensor = torch.from_numpy(csi).unsqueeze(0)
     gt_tensor = torch.from_numpy(gt_clip).unsqueeze(0)
-    return csi_tensor, gt_tensor, actual_len
+    return model_in_tensor, csi_tensor, gt_tensor, actual_len
 
 
 def draw_skeleton_3d(ax, joints, bones, colors, label, alpha=1.0, lw=2.5, ms=5):
-    """Draw 3D skeleton. joints should already be remapped to (plot_x, plot_y, plot_z)."""
     for bone in bones:
         i, j = bone
         ax.plot([joints[i, 0], joints[j, 0]],
                 [joints[i, 1], joints[j, 1]],
                 [joints[i, 2], joints[j, 2]],
                 color=colors[bone], alpha=alpha, linewidth=lw)
-
     ax.scatter(joints[:, 0], joints[:, 1], joints[:, 2],
                c='black', s=ms**2, alpha=alpha, zorder=5)
     ax.plot([], [], [], color=colors[bones[0]], label=label, linewidth=lw)
 
 
 def set_axes_equal(ax, joints_list):
-    """Set equal aspect ratio for 3D plot."""
     all_joints = np.concatenate(joints_list, axis=0)
     mid = all_joints.mean(axis=0)
     max_range = (all_joints.max(axis=0) - all_joints.min(axis=0)).max() / 2
     max_range = max(max_range, 0.3)
-
     ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
     ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
     ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
@@ -186,22 +182,17 @@ def set_axes_equal(ax, joints_list):
 
 
 def visualize_single_frame(gt, pred, frame_idx, save_path, axis_order, flip_z=False, metrics_text=""):
-    """GT vs Pred from two views."""
     fig = plt.figure(figsize=(16, 7))
     fig.suptitle(f'Frame {frame_idx}  {metrics_text}', fontsize=13, fontweight='bold')
-
     gt_f = remap_joints(gt[frame_idx], axis_order, flip_z)
     pred_f = remap_joints(pred[frame_idx], axis_order, flip_z)
-
     for idx, (elev, azim, title) in enumerate([
         (20, -60, 'Front View'),
         (80, -90, 'Top View'),
     ]):
         ax = fig.add_subplot(1, 2, idx + 1, projection='3d')
-        draw_skeleton_3d(ax, gt_f, BONES, BONE_COLORS_GT, 'Ground Truth',
-                         alpha=0.9, lw=3, ms=6)
-        draw_skeleton_3d(ax, pred_f, BONES, BONE_COLORS_PRED, 'Prediction',
-                         alpha=0.7, lw=2.5, ms=5)
+        draw_skeleton_3d(ax, gt_f, BONES, BONE_COLORS_GT, 'Ground Truth', alpha=0.9, lw=3, ms=6)
+        draw_skeleton_3d(ax, pred_f, BONES, BONE_COLORS_PRED, 'Prediction', alpha=0.7, lw=2.5, ms=5)
         for j in range(17):
             ax.plot([gt_f[j, 0], pred_f[j, 0]],
                     [gt_f[j, 1], pred_f[j, 1]],
@@ -211,7 +202,6 @@ def visualize_single_frame(gt, pred, frame_idx, save_path, axis_order, flip_z=Fa
         ax.set_title(title, fontsize=11)
         ax.view_init(elev=elev, azim=azim)
         set_axes_equal(ax, [gt_f, pred_f])
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -219,77 +209,61 @@ def visualize_single_frame(gt, pred, frame_idx, save_path, axis_order, flip_z=Fa
 
 
 def visualize_error_analysis(gt, pred, actual_len, save_path):
-    """Per-joint error heatmap + temporal + bar chart."""
     gt_np = gt[:actual_len]
     pred_np = pred[:actual_len]
     per_joint_error = np.linalg.norm(gt_np - pred_np, axis=-1) * 1000
-
     fig = plt.figure(figsize=(16, 10))
     gs = GridSpec(2, 2, height_ratios=[1.2, 1], hspace=0.35, wspace=0.3)
-
     ax1 = fig.add_subplot(gs[0, :])
     im = ax1.imshow(per_joint_error.T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
-    ax1.set_yticks(range(17))
-    ax1.set_yticklabels(JOINT_NAMES, fontsize=8)
+    ax1.set_yticks(range(17)); ax1.set_yticklabels(JOINT_NAMES, fontsize=8)
     ax1.set_xlabel('Frame', fontsize=10)
     ax1.set_title('Per-Joint Error Over Time (mm)', fontsize=12, fontweight='bold')
     plt.colorbar(im, ax=ax1, shrink=0.8).set_label('Error (mm)', fontsize=9)
-
     ax2 = fig.add_subplot(gs[1, 0])
     mean_err = per_joint_error.mean(axis=1)
     ax2.plot(mean_err, color='#d62728', linewidth=1.5)
     ax2.fill_between(range(len(mean_err)), per_joint_error.min(axis=1),
                      per_joint_error.max(axis=1), alpha=0.2, color='#d62728')
-    ax2.set_xlabel('Frame', fontsize=10)
-    ax2.set_ylabel('MPJPE (mm)', fontsize=10)
+    ax2.set_xlabel('Frame', fontsize=10); ax2.set_ylabel('MPJPE (mm)', fontsize=10)
     ax2.set_title('Temporal Error', fontsize=11, fontweight='bold')
     ax2.axhline(y=mean_err.mean(), color='gray', linestyle='--', alpha=0.5,
                 label=f'Avg: {mean_err.mean():.1f}mm')
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3)
-
+    ax2.legend(fontsize=9); ax2.grid(True, alpha=0.3)
     ax3 = fig.add_subplot(gs[1, 1])
     joint_err = per_joint_error.mean(axis=0)
     colors = ['#d62728' if e > np.median(joint_err) else '#2ca02c' for e in joint_err]
     ax3.barh(range(17), joint_err, color=colors, alpha=0.8)
-    ax3.set_yticks(range(17))
-    ax3.set_yticklabels(JOINT_NAMES, fontsize=8)
+    ax3.set_yticks(range(17)); ax3.set_yticklabels(JOINT_NAMES, fontsize=8)
     ax3.set_xlabel('Mean Error (mm)', fontsize=10)
     ax3.set_title('Per-Joint Mean Error', fontsize=11, fontweight='bold')
     ax3.axvline(x=joint_err.mean(), color='gray', linestyle='--', alpha=0.5)
     for i, v in enumerate(joint_err):
         ax3.text(v + 1, i, f'{v:.0f}', va='center', fontsize=7)
     ax3.grid(True, alpha=0.3, axis='x')
-
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path}")
 
 
 def visualize_multi_frame(gt, pred, actual_len, save_path, axis_order, flip_z=False, num_frames=8):
-    """Multiple frames in a grid."""
     step = max(1, actual_len // num_frames)
     frames = list(range(0, actual_len, step))[:num_frames]
-
     ncols = min(4, len(frames))
     nrows = (len(frames) + ncols - 1) // ncols
     fig = plt.figure(figsize=(4.5 * ncols, 4.5 * nrows))
     fig.suptitle('Multi-Frame Skeleton (GT=solid, Pred=light)', fontsize=13, fontweight='bold')
-
     for plot_idx, f_idx in enumerate(frames):
         ax = fig.add_subplot(nrows, ncols, plot_idx + 1, projection='3d')
         gt_f = remap_joints(gt[f_idx], axis_order, flip_z)
         pred_f = remap_joints(pred[f_idx], axis_order, flip_z)
-
         draw_skeleton_3d(ax, gt_f, BONES, BONE_COLORS_GT, 'GT', alpha=0.9, lw=2, ms=4)
         draw_skeleton_3d(ax, pred_f, BONES, BONE_COLORS_PRED, 'Pred', alpha=0.6, lw=1.5, ms=3)
-
         err = np.linalg.norm(gt[f_idx] - pred[f_idx], axis=-1).mean() * 1000
         ax.set_title(f'F{f_idx} ({err:.0f}mm)', fontsize=9)
         ax.view_init(elev=20, azim=-60)
         set_axes_equal(ax, [gt_f, pred_f])
         ax.tick_params(labelsize=6)
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -297,11 +271,10 @@ def visualize_multi_frame(gt, pred, actual_len, save_path, axis_order, flip_z=Fa
 
 
 def visualize_csi_input(csi_np, actual_len, save_path):
-    """CSI input amplitude + phase heatmaps."""
+    """CSI input amplitude + phase heatmaps (9 通道原始 CSI)."""
     fig, axes = plt.subplots(3, 2, figsize=(14, 8))
     fig.suptitle('CSI Input Visualization', fontsize=13, fontweight='bold')
     clip = csi_np[:actual_len]
-
     for ant in range(3):
         amp_map = clip[:, ant, :, :].mean(axis=-1)
         ax = axes[ant, 0]
@@ -310,14 +283,12 @@ def visualize_csi_input(csi_np, actual_len, save_path):
         if ant == 0: ax.set_title('Amplitude', fontsize=11, fontweight='bold')
         if ant == 2: ax.set_xlabel('Frame', fontsize=10)
         plt.colorbar(im, ax=ax, shrink=0.7)
-
         phase_map = clip[:, 3 + ant, :, :].mean(axis=-1)
         ax = axes[ant, 1]
         im = ax.imshow(phase_map.T, aspect='auto', cmap='twilight', interpolation='nearest')
         if ant == 0: ax.set_title('Phase (sin)', fontsize=11, fontweight='bold')
         if ant == 2: ax.set_xlabel('Frame', fontsize=10)
         plt.colorbar(im, ax=ax, shrink=0.7)
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -334,14 +305,37 @@ def main():
     parser.add_argument('--start_frame', type=int, default=0)
     parser.add_argument('--frame', type=int, default=30)
     parser.add_argument('--save_dir', type=str, default='viz_output')
+    # ---- vision(图像渲染)权重支持 ----
+    parser.add_argument('--vision', action='store_true',
+                        help='加载图像渲染(vision backbone)权重; 输入渲染成 3 通道图')
+    parser.add_argument('--vision_arch', type=str, default='resnet18')
+    parser.add_argument('--vision_img_size', type=int, default=112,
+                        help='必须与训练 img_stage2 时的 --vision_img_size 一致')
     args_viz = parser.parse_args()
 
     os.makedirs(args_viz.save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model_args = get_config(inference_only=True)
+    renderer = None
+    if args_viz.vision:
+        # 镜像 train_stage2_image.py 的 vision 配置; vision_scratch=True 避免联网下 ImageNet
+        # (结构不变, 权重马上被 ckpt 覆盖)
+        model_args.use_vision_backbone = True
+        model_args.vision_in_channels = 3
+        model_args.vision_arch = args_viz.vision_arch
+        model_args.vision_img_size = args_viz.vision_img_size
+        model_args.vision_scratch = True
+        model_args.vision_weights = None
+        model_args.vision_no_instance_norm = False
+        model_args.vision_freeze = False
+        renderer = CSIImagePreprocessor(img_size=args_viz.vision_img_size,
+                                        channels=("phase", "amp", "doppler"),
+                                        antenna_quotient=True)
+
     print(f"\n{'='*60}")
     print(f"Loading model from: {args_viz.checkpoint}")
+    print(f"Mode: {'VISION (rendered images)' if args_viz.vision else 'RAW CSI (baseline)'}")
     model = CSIRSCPoseDG(model_args).to(device)
 
     if os.path.exists(args_viz.checkpoint):
@@ -356,26 +350,23 @@ def main():
     model.eval()
 
     print(f"\n{'='*60}")
-    csi_tensor, gt_tensor, actual_len = load_single_sample(
+    model_in_tensor, csi_tensor, gt_tensor, actual_len = load_single_sample(
         args_viz.data_root, args_viz.env, args_viz.subject, args_viz.action,
-        args_viz.start_frame, model_args.seq_len
+        args_viz.start_frame, model_args.seq_len, renderer=renderer
     )
 
-    # Get action index from args
     action_idx_val = int(args_viz.action[1:]) - 1
     action_idx_tensor = torch.tensor([action_idx_val], dtype=torch.long, device=device)
 
     print(f"\nRunning inference (action={args_viz.action}, idx={action_idx_val})...")
     with torch.no_grad():
-        # With GT action (oracle)
-        outputs = model(csi_tensor.to(device), action_idx=action_idx_tensor)
+        outputs = model(model_in_tensor.to(device), action_idx=action_idx_tensor)
         pred_tensor = outputs['p_final'].cpu()
 
     gt_np = gt_tensor[0].numpy()
     pred_np = pred_tensor[0].numpy()
     csi_np = csi_tensor[0].numpy()
 
-    # Auto-detect vertical axis
     axis_order, flip_z = detect_vertical_axis(gt_np)
     axis_names = ['X', 'Y', 'Z']
     print(f"\nAuto-detected axes: "
@@ -383,13 +374,11 @@ def main():
           f"plot_Y=data_{axis_names[axis_order[1]]}, "
           f"plot_Z(vertical)=data_{axis_names[axis_order[2]]}")
 
-    # Verify: print Hip->Head in remapped coords
     gt_remapped = remap_joints(gt_np[0], axis_order, flip_z)
     hip_head = gt_remapped[10] - gt_remapped[0]
     print(f"Hip->Head (remapped): [{hip_head[0]:.3f}, {hip_head[1]:.3f}, {hip_head[2]:.3f}]")
     print(f"Vertical component (Z) should be the largest: {hip_head[2]:.3f}")
 
-    # Metrics
     print(f"\n{'='*60}")
     print("Evaluation Metrics:")
     gt_eval = gt_tensor[:, :actual_len]
@@ -411,28 +400,26 @@ def main():
 
     metrics_text = f'MPJPE={mpjpe_val:.1f}mm  PA-MPJPE={pa_mpjpe_val:.1f}mm'
     prefix = f"{args_viz.env}_{args_viz.subject}_{args_viz.action}"
+    if args_viz.vision:
+        prefix += "_vision"
 
     print(f"\n{'='*60}")
     print("Generating visualizations...")
-
     visualize_single_frame(
         gt_np, pred_np, frame_idx,
         os.path.join(args_viz.save_dir, f'{prefix}_frame{frame_idx}_skeleton.png'),
         axis_order, flip_z,
         metrics_text=f'Frame MPJPE={frame_err:.1f}mm  |  Seq {metrics_text}'
     )
-
     visualize_multi_frame(
         gt_np, pred_np, actual_len,
         os.path.join(args_viz.save_dir, f'{prefix}_multi_frame.png'),
         axis_order, flip_z, num_frames=8
     )
-
     visualize_error_analysis(
         gt_np, pred_np, actual_len,
         os.path.join(args_viz.save_dir, f'{prefix}_error_analysis.png')
     )
-
     visualize_csi_input(
         csi_np, actual_len,
         os.path.join(args_viz.save_dir, f'{prefix}_csi_input.png')

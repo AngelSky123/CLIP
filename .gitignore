@@ -1,3 +1,26 @@
-/checkpoints
-/checkpoints_standard
-/viz_output
+# 1. 忽略模型权重文件
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.h5
+*.onnx
+*.safetensors
+weights/
+checkpoints/
+
+# 2. 忽略训练日志和可视化输出
+logs/
+runs/
+wandb/
+*.log
+
+# 3. 忽略 Python 缓存和虚拟环境
+__pycache__/
+*.pyc
+venv/
+.env
+
+# 4. 忽略系统或编辑器生成的隐藏文件
+.vscode/
+.DS_Store
