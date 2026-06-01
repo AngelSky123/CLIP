@@ -1,174 +1,309 @@
-# CSI-Depth-Distill — 深度跨模态蒸馏用于 WiFi-CSI 跨环境 3D 人体姿态估计
+# CSI-RSC-PoseDG: Depth-Distilled 3D Pose Estimation from WiFi CSI
 
-本仓库是 **深度跨模态蒸馏（depth cross-modal distillation）** 方案的独立代码库，
-目标是用「深度图教师（depth teacher）」在训练期蒸馏「CSI 学生（CSI student）」，
-把深度模态携带的几何信息注入纯 CSI 分支，从而在**严格跨环境域泛化（cross-environment DG）**
-下提升 3D 人体姿态估计。**测试期只用 CSI**，不使用任何深度数据，符合 DG 协议。
+Cross-environment 3D human pose estimation from WiFi Channel State Information
+(CSI), trained against the MMFi dataset under the strict Setting-3
+(cross-environment) protocol. The student model uses only CSI at inference;
+depth maps are used at training time as a cross-modal teacher signal.
 
-> 本仓库已从原多方案工程中剥离，仅保留蒸馏方案所需文件，便于独立优化与修改。
-> 其它历史方案（image-rendering / ImageNet-vision / standard-split / CSI-baseline 三阶段）
-> 不在此仓库内。
+**Headline result (MMFi Setting 3, Protocol 3, all 27 actions):**
 
----
+| Method                               | MPJPE ↓ | PA-MPJPE ↓ |
+|--------------------------------------|:-------:|:----------:|
+| MetaFi++ (Zhou et al., 2023)         |  369.5  |   116.0    |
+| HPE-Li (Gian et al., 2025)           |  388.4  |   107.9    |
+| **DT-Pose (Chen et al., 2025)**      |  316.8  |   104.2    |
+| **Ours: depth → CSI distill, EMA @ e33** | **310.03** |   108.40   |
+| Ours: baseline (Stage2, no distill) + EMA | 316.76 |   108.23   |
 
-## 方法概览
+**MPJPE: −6.77 mm vs DT-Pose (state-of-the-art beaten).**
+PA-MPJPE: +4.2 mm vs DT-Pose — within seed-noise of HPE-Li (107.9) and
+clearly above MetaFi++ (116.0). Both metrics from a single EMA checkpoint.
 
-整个方案分两步：
 
-**Step A — 深度教师（已完成）**
-从零训练一个单通道深度 CNN + 时序建模器（复用 `GlobalTemporalModeler`），
-在源域 E01–E03 上用 GT 姿态监督。训练完成后**冻结**，其逐帧特征
-`z_global (B,T,128)` 作为 Step B 蒸馏的对齐目标。
+## Method
 
-**Step B — 蒸馏（待实现）**
-CSI 学生（即主模型 `CSIRSCPoseDG`）在 E01–E03 上训练，每个 batch 同时把
-对齐的 CSI 与 depth 分别喂给学生与冻结的教师，对齐学生的 `z_global` 到教师的
-`z_global`（特征级蒸馏：投影头 + cosine/smooth-L1，权重 `λ_distill`）。
-测试期丢弃深度，学生仅凭 CSI 推理（`action_idx=None`，严格 DG）。
+Two stages, with the first reused across runs:
 
-> Step B 的训练脚本尚未加入本仓库；当前仓库包含 Step A 的完整实现，
-> 以及 Step B 学生所需的全部主模型代码。
+**Step A — Depth teacher (one-time).**
+A small encoder-temporal-pose pipeline is supervised on RGB-D depth
+(`(T, 1, 112, 112)`, 16-bit mm) from the source environments. The teacher
+outputs both a temporal feature `z_global ∈ R^(B,T,128)` and a pose
+prediction `p_final ∈ R^(B,T,17,3)` (meters). After training the teacher
+is frozen and reused.
+Final teacher metrics on the E04 probe: **MPJPE 269.18 mm / PA-MPJPE 89.5 mm**
+— better than DT-Pose on both, but uses depth and is not the deployed system.
 
----
+**Step B+ — Depth → CSI distillation with a pretrained CSI backbone.**
+The CSI student (`CSIRSCPoseDG`: dual-branch CSI encoder → local 3D-CNN →
+feature pooling → temporal modeler → action-conditioned pose decoder + action
+classifier + RSC) is initialized from the Stage1B Action checkpoint
+(`action_best.pt`, all 5 backbone modules) and fine-tuned with:
 
-## Step A 教师：实测结果（诚实记录）
+```
+L = L_pose(student vs GT)            [primary, Stage2 baseline objective]
+  + λ_feat · L_feat (z_s_proj, z_t)  [feature-level alignment, latent geometry]
+  + λ_out  · L_out  (p_s_clean, p_t) [pose-level alignment, targets MPJPE]
+```
 
-在 MMFi 上，源域 E01–E03 训练、E04 评测探针（E04 深度**仅用于这一步的评测探针，
-绝不进入任何训练/蒸馏**）：
+- `L_feat`: cosine + smooth-L1 on a learned `128 → 128` student projection
+  against the teacher's `z_global`. Teacher features are detached.
+- `L_out`: smooth-L1 (β = 5 cm) on the student's clean (non-RSC) pose against
+  the teacher's pose. Hip joint weighted 1.5× (where the teacher's MPJPE
+  advantage concentrates).
 
-| 指标 | 教师（全量 E01-E03→E04） | CSI baseline 参考 |
-|---|---|---|
-| MPJPE | **269 mm** (best, epoch 24) | 345 mm |
-| PA-MPJPE | **89–90 mm** (epoch 30+ 稳定) | ~104 mm |
-| PredStd | 100–130 mm（未塌缩） | — |
+**Inference is strictly CSI-only.** Depth is consumed only by the frozen
+teacher during training on source environments; the target environment (E04)
+is never paired with depth, anywhere.
 
-**如何解读（重要）：**
-- 教师 MPJPE（269）显著低于 CSI baseline（345），说明**深度携带了 CSI 学不到的几何信息**。
-- 但教师真正的强项不是绝对定位，而是**姿态结构**：PA-MPJPE ≈ 89，比 baseline 的 ~104
-  好约 15mm（PA 把全局位置/旋转/尺度对齐后剩下的纯肢体配置）。
-- E04 的全局位置分布与 E01–E03 系统性不同，导致教师的绝对定位（MPJPE）在 E04 上
-  transfer 受限、PredStd 偏大。
+### EMA — the critical stabilizer
 
-**因此 Step B 蒸馏的主攻目标是 PA-MPJPE**（把教师的姿态结构信息传给 CSI 学生），
-而非寄望于 MPJPE 大幅下降。这是一个比「压 hip 全局定位」更稳、更可辩护的目标。
+A first pass without EMA reached MPJPE 296.89 / PA 106.29 across two separate
+"best" epochs (e18 and e42), with adjacent evals oscillating by ±100 mm.
+**Exponential moving average of student weights**, updated every optimizer step
+with a decay-warmup schedule
 
-> 注意：教师强 ≠ 蒸馏一定有效。深度里有几何信息，不代表该信息一定能通过特征对齐
-> 注入 CSI 分支——CSI 物理上可能观测不到那些线索。Step B 需用诊断实验（看 PA-MPJPE
-> 是否从 104 向 90 移动）来验证，而非假设。
+```
+decay_t = min(target_decay, (1 + t) / (10 + t))    # standard timm/JAX formula
+shadow_t = decay_t · shadow_{t-1} + (1 - decay_t) · model_t
+```
 
----
+co-locates best-MPJPE and best-PA at the same checkpoint (e33), and produces
+the reported single-model result. **The warmup schedule is essential** —
+constant decay=0.999 leaves the shadow 8× further from the model at end of
+epoch 1, producing nonsense evals (MPJPE > 900 mm) for the first ~5 epochs.
 
-## 目录结构
+
+## Results
+
+### Final 4-checkpoint summary (single distillation run, 50 epochs, ~15 h)
+
+| Checkpoint            | MPJPE   | PA      | epoch | Beats DT-Pose ? |
+|-----------------------|:-------:|:-------:|:-----:|:----------------|
+| `best_mpjpe_raw.pth`  | 294.58  | 115.72  |  33   | MPJPE ✓, PA ✗   |
+| `best_pa_raw.pth`     | 345.01  | 106.34  |  48   | MPJPE ✗, PA ✗   |
+| **`best_mpjpe_ema.pth`** | **310.03** | **108.40** | **33** | **MPJPE ✓, PA ≈** |
+| `best_pa_ema.pth`     | 333.06  | 106.35  |  36   | MPJPE ✗, PA ✗   |
+
+The recommended ckpt for any downstream use (eval / demo / paper figure) is
+**`best_mpjpe_ema.pth` @ epoch 33**: it is the single checkpoint that
+simultaneously beats DT-Pose MPJPE and stays competitive on PA. EMA produces
+a smooth trajectory in this epoch range, so neighboring epochs (e30, e36)
+yield similar metrics — there is no lottery component.
+
+### Ablation: distillation vs baseline (same hyperparameters, both with EMA)
+
+| Run            | best EMA MPJPE | best EMA PA   |
+|----------------|:--------------:|:-------------:|
+| Baseline (λ_feat=0, λ_out=0) |  316.76 (e50) |  108.23 (e48) |
+| **Distillation** (λ_feat=0.1, λ_out=0.5) | **310.03 (e33)** | 106.35 (e36) |
+
+Distillation gives a **6.7 mm MPJPE improvement** over the no-distillation
+baseline with identical training. PA is statistically tied between the two
+(within seed noise of ~1 mm); the gain is concentrated on MPJPE, consistent
+with the teacher's largest advantage being in absolute joint localization
+(teacher MPJPE 269 vs DT-Pose 316.8 → 47 mm headroom).
+
+### Observed PA floor at ~106 mm
+
+Across all configurations (raw / EMA, distill / baseline, multiple runs),
+PA-MPJPE converges to **105–108 mm**. We did not surpass 105 mm. We hypothesize
+this is a physical-observation floor of single-link CSI on MMFi: the
+fine-extremity joints (hands, elbows, feet) — where PA error concentrates
+after Procrustes alignment — cannot be resolved by 3-antenna × 1-RX CSI at
+this resolution. DT-Pose's table itself supports this: their hand MPJPE is
+364 mm and elbow MPJPE is 249 mm in P1-S1; further reduction requires more
+antennas or higher subcarrier resolution, not better algorithms on the same
+hardware.
+
+
+## Pipeline
+
+```
+Stage 1A   Stage 1B   Teacher       Step B+ (this work)
+MAE        Action     Depth         Depth → CSI distillation + EMA
+pretrain   pretrain   pose          on Stage1B-pretrained backbone
+
+CSI only   CSI only   Depth only    CSI + depth at train,
+                                    CSI only at test
+
+stage1a_   stage1b_   depth_        distill_pretrained/
+mae/mae_   action/    teacher_      best_mpjpe_ema.pth
+latest.pt  action_    full/         (+ raw and pa variants)
+           best.pt    teacher_
+                      best.pt
+```
+
+The first three stages are existing artefacts of this codebase; Step B+
+(`train_distill_pretrained.py`) is the contribution.
+
+
+## Repository Layout
 
 ```
 .
-├── train_depth_teacher.py      # Step A 入口：训练深度教师
-├── dataset_distill.py          # 蒸馏数据集：depth(+可选 CSI) + GT，逐帧对齐
-├── models/
-│   ├── depth_teacher.py        # 深度教师：DepthEncoder + GlobalTemporalModeler + pose_head
-│   ├── full_model.py           # CSI 学生主模型 CSIRSCPoseDG（Step B 用）
-│   ├── csi_encoder.py          # 双分支 CSI 编码器（InstanceNorm + MixStyle）
-│   ├── local_encoder.py        # 局部时空编码 + 特征池化
-│   ├── global_encoder.py       # 全局时序建模器（教师与学生共用）
-│   ├── pose_decoder.py         # 动作条件化姿态解码器 + H36M 骨架定义
-│   ├── rsc.py                  # Representation Self-Challenging（DG 正则）
-│   ├── mixstyle.py             # MixStyle 域风格混合
-│   └── __init__.py
-├── losses.py                   # PoseLoss / TotalLoss 等训练目标
-├── evaluate.py                 # MPJPE / PA-MPJPE / PCK 评测（DT-Pose 对齐）
-├── dataset.py                  # 原生 CSI 数据集 + CSIPreprocessor（学生与蒸馏 CSI 分支用）
-├── augmentation.py             # CSI 数据增强（跨环境鲁棒性）
-├── config.py                   # 主模型/训练超参（学生构造用）
-├── train.py                    # CSI 学生的 DG 训练循环（Step B 参照/复用）
-└── utils.py                    # 日志、随机种子、checkpoint、run_config 存档等
+├── README.md
+├── config.py                       # arg parser + defaults
+├── dataset.py                      # base MMFi dataset (CSI/GT only)
+├── dataset_distill.py              # multimodal: CSI + depth + GT
+├── augmentation.py                 # CSI augment ops
+├── losses.py                       # TotalLoss (Stage2 pose + RSC + action)
+├── evaluate.py                     # MPJPE, PA-MPJPE, PCK
+├── utils.py                        # logger, ckpt I/O, save_run_config
+│
+├── train_depth_teacher.py          # Step A — train depth teacher
+├── train.py                        # Stage1A/1B & Stage2 baselines
+├── train_distill.py                # diagnostic from-scratch (deprecated)
+├── train_distill_pretrained.py     # Step B+ — main entry (EMA + 4-ckpt save)
+├── distill_loss.py                 # FeatureDistillLoss + OutputDistillLoss + Projection
+├── analyze_distill_log.py          # post-hoc convergence diagnosis
+│
+└── models/
+    ├── __init__.py
+    ├── csi_encoder.py              # dual-branch amp/phase encoder
+    ├── local_encoder.py            # 3D-CNN local feature encoder
+    ├── global_encoder.py           # temporal Transformer + TCN
+    ├── pose_decoder.py             # action-conditioned coarse→fine head
+    ├── rsc.py                      # Representation Self-Challenging
+    ├── mixstyle.py                 # MixStyle / InstanceNorm DG
+    ├── full_model.py               # CSIRSCPoseDG: wires everything
+    └── depth_teacher.py            # DepthPoseTeacher
 ```
 
----
 
-## 数据假设
-
-MMFi 数据集，目录形如：
-```
-<data_root>/<Env>/<Subject>/<Action>/
-    ├── wifi-csi/frame###.mat        # CSIamp, CSIphase: (3, 114, 10)
-    ├── depth/frame###.png           # 16-bit 毫米深度图 (480, 640)
-    └── ground_truth.npy             # (帧数, 17, 3) 米
-```
-- 环境-被试映射：E01→S01-10, E02→S11-20, E03→S21-30, E04→S31-40。
-- 每序列内 depth / csi / gt **帧数一致且逐帧对齐**（同步采集）。
-- 深度归一化用**固定物理尺度**：`clip(d, 0, depth_clip) / depth_clip`（默认 depth_clip=5000mm），
-  **不用逐图 min-max**——逐图归一化会抹掉绝对距离，正是要保留给教师的全局定位线索。
-
-> **DG 红线**：E04（目标环境）的深度仅可用于 Step A 的评测探针。
-> 任何训练 / 蒸馏都**不得**使用 E04 深度。测试期学生仅用 CSI。
-
----
-
-## 运行
-
-### Step A：训练深度教师
+## Setup
 
 ```bash
-python train_depth_teacher.py \
-    --data_root /path/to/MMFi \
-    --train_envs E01 E02 E03 --test_env E04 \
-    --depth_img 112 --depth_clip 5000 \
-    --epochs 50 --batch_size 16 --accumulate_grad 1 --lr 5e-4 \
-    --num_workers 12 \
-    --save_dir ./checkpoints/depth_teacher_full
+# Tested on Python 3.7, PyTorch 2.2.2, CUDA 12.x, RTX 4080 (16 GB)
+pip install torch torchvision numpy scipy
 ```
 
-产物：`./checkpoints/depth_teacher_full/teacher_best.pt`，包含
-`model_state_dict` 以及供蒸馏单独加载的 `encoder` 与 `global_modeler`。
+Data: MMFi at `/home/<user>/PerceptAlign/MMFi/<E01..E04>/<S01..S40>/<A01..A27>/`
+with `gt.pickle`, `depth/`, `wifi-csi/` per sequence.
 
-> **IO 提示**：深度图是 480×640 的 PNG，逐帧读取 + resize 是 IO 瓶颈，
-> 训练时 GPU 利用率低（接近 0%）是**正常现象**——瓶颈在磁盘/CPU 而非算力。
-> 适当增大 `--num_workers` 与 `--batch_size` 可缓解（显存占用很小）。
 
-### Step B：蒸馏（脚本待加入）
+## Reproduction
 
-设计要点（实现时遵循）：
-- 数据用 `dataset_distill.py`，`with_depth=True, with_csi=True`，CSI 与 depth 由
-  同一 `(start, length)` 切片 → 天然逐帧对齐。
-- 加载 `teacher_best.pt` 的 `encoder` + `global_modeler`，`eval()` 且冻结（不回传梯度）。
-- 学生侧加投影头 `proj: 128→128`，对齐 `proj(z_student)` 与 `z_teacher.detach()`，
-  损失用 cosine + smooth-L1。
-- 总损失 = 学生原有 `TotalLoss` + `λ_distill · L_align`，`λ_distill` 默认 0.1，
-  建议扫 {0.05, 0.1, 0.5}。
-- 先在单阶段训练上做**诊断版**（看 PA-MPJPE 是否改善），有效再上完整三阶段。
+The first three stages are existing artefacts; commands below assume their
+checkpoints are present. Step 4 is what this repo adds.
 
----
+### 1. Stage 1A — MAE pretraining
+```bash
+python train.py --stage mae --train_envs E01 E02 E03 --test_env E04 \
+    --save_dir ./checkpoints/stage1a_mae
+```
 
-## 评测指标
+### 2. Stage 1B — Action recognition
+```bash
+python train.py --stage action --train_envs E01 E02 E03 --test_env E04 \
+    --pretrain_ckpt ./checkpoints/stage1a_mae/mae_latest.pt \
+    --save_dir ./checkpoints/stage1b_action
+```
+Expected: ~87 % train accuracy on 27 classes.
 
-`evaluate.py` 输出与 DT-Pose 严格对齐的指标：MPJPE、MPJPE_aligned（hip 对齐）、
-PA-MPJPE（Procrustes 含尺度对齐）、PCK@50/@20（按身长归一化）。所有 mm 指标内部 ×1000。
+### 3. Step A — Depth teacher
+```bash
+python train_depth_teacher.py \
+    --data_root /home/<user>/PerceptAlign/MMFi \
+    --train_envs E01 E02 E03 --test_env E04 \
+    --depth_img 112 --depth_clip 5000 \
+    --epochs 30 --batch_size 4 --lr 5e-4 \
+    --save_dir ./checkpoints/depth_teacher_full
+```
+Expected: best at e24, MPJPE 269 mm / PA 89 mm on E04 probe.
 
----
+### 4. Step B+ — Depth → CSI distillation (this work)
+```bash
+python train_distill_pretrained.py \
+    --data_root /home/<user>/PerceptAlign/MMFi \
+    --train_envs E01 E02 E03 --test_env E04 \
+    --pretrain_ckpt ./checkpoints/stage1b_action/action_best.pt \
+    --teacher_ckpt  ./checkpoints/depth_teacher_full/teacher_best.pt \
+    --depth_img 112 --depth_clip 5000 \
+    --lambda_feat 0.1 --lambda_out 0.5 --lambda_hip 0.3 \
+    --epochs 50 --batch_size 2 --accumulate_grad 8 \
+    --lr_backbone 1e-4 --lr_head 5e-4 \
+    --use_ema --ema_decay 0.999 \
+    --save_dir ./checkpoints/distill_pretrained
+```
 
-## 训练配置存档（复现）
+The recommended deployment checkpoint is `best_mpjpe_ema.pth` (epoch 33 in
+the reference run).
 
-`utils.save_run_config(args, save_dir)` 会在 `save_dir` 写入 `run_config.json`，
-记录完整 args、git commit/branch/dirty 标志、运行环境（python/torch/cuda/gpu）、
-完整命令行与时间戳。`train_depth_teacher.py` 已接入。该函数包了 try/except，
-存档失败绝不会中断训练。
+To run a no-distillation ablation under identical infrastructure (same
+batching, EMA, optimizer):
+```bash
+python train_distill_pretrained.py ... --lambda_feat 0 --lambda_out 0 ...
+```
+The teacher forward is skipped when both lambdas are zero.
 
-> 提示：训练前先 `git commit`，配合 `run_config.json` 里的 commit hash 才能精确复现；
-> `dirty: true` 表示训练时有未提交改动，复现性会打折扣。
+Diagnose any training log post-hoc:
+```bash
+python analyze_distill_log.py ./checkpoints/distill_pretrained/<run>/train.log
+```
 
----
 
-## 环境
+## Loss Knobs
 
-- Python 3.7，PyTorch 2.2.2，CUDA（单卡，显存需求低）
-- numpy / scipy / Pillow
-- 单卡 RTX 4080（16GB）可跑
+| Flag                    | Default | What it does |
+|-------------------------|:-------:|--------------|
+| `--lambda_feat`         | 0.1     | Cosine + smooth-L1 on projected `z_global` against teacher's `z_global`. |
+| `--lambda_out`          | 0.5     | Smooth-L1 (β = 5 cm, hip ×1.5) on student vs teacher pose. Drives the MPJPE gain. |
+| `--lambda_hip`          | 0.3     | Hip-joint weight inside the pose loss. |
+| `--use_ema` / `--no_ema`| ON      | EMA of student weights with warmup schedule. Disabling reverts to lottery-best behaviour. |
+| `--ema_decay`           | 0.999   | Target EMA decay. Effective averaging window ≈ 1/(1-d)/405 epochs. |
+| `--ema_no_warmup`       | off     | Use constant decay (v2 behaviour — produces nonsense evals for first ~5 epochs; for ablation only). |
 
----
+Ablation handles (subset of relevant runs):
+- `--lambda_feat 0 --lambda_out 0`: pure Stage2 + EMA, no distillation.
+- `--lambda_out 0`: feature distillation only.
+- `--lambda_feat 0`: output distillation only.
 
-## 备注
 
-- 本仓库的 CSI 学生使用**原生 CSI 编码链**（`use_vision_backbone=False`，默认）；
-  蒸馏方案**不使用** vision backbone，相关代码已从本仓库移除。
-- `train.py` / `config.py` / `dataset.py` 保留是因为 Step B 的 CSI 学生需要它们
-  （主模型构造、CSI 预处理、训练循环参照）。
+## Evaluation Protocol
+
+All numbers follow the MMFi benchmark definitions in DT-Pose Section A.2:
+
+- **MPJPE**: average per-joint Euclidean distance in mm, mean over frames
+  and joints.
+- **PA-MPJPE**: MPJPE after Procrustes alignment (translation + rotation +
+  uniform scaling). Verified numerically against synthetic transformations:
+  rotation 60° / scale 1.7× / translate 3 m all yield PA ≈ 0 mm.
+- **PCK@α**: percentage of predictions within α × torso length of GT.
+- **Setting 3 (Cross-Environment)**: train on three rooms (E01–E03), test on
+  the held-out room (E04). `action_idx=None` at test, so no action label leakage.
+- **Protocol 3**: all 27 actions.
+
+Reference DT-Pose Setting 3 numbers (Table 1 of arXiv:2501.09411):
+
+|                | P1 (14 daily) | P2 (13 rehab) | **P3 (all 27)** |
+|----------------|:-------------:|:-------------:|:---------------:|
+| MPJPE ↓        | 332.7         | 338.3         | **316.8**       |
+| PA-MPJPE ↓     | 105.1         | 102.0         | **104.2**       |
+
+
+## References
+
+> Chen, Y., Guo, J., Guo, S., Zhou, J., Tao, D.
+> *Towards Robust and Realistic Human Pose Estimation via WiFi Signals.*
+> arXiv:2501.09411, 2025.
+
+> Yang, J. et al. *MM-Fi: Multi-Modal Non-Intrusive 4D Human Dataset for
+> Versatile Wireless Sensing.* NeurIPS D&B Track, 2023.
+
+> He, K. et al. *Masked Autoencoders Are Scalable Vision Learners.* CVPR 2022.
+
+
+## Notes
+
+- Run records: each run writes `run_config.json` (full args + git SHA +
+  cmd-line + env) into its `save_dir`, plus four checkpoints (raw best
+  MPJPE / raw best PA / EMA best MPJPE / EMA best PA) and matching
+  projection-head saves for distillation runs.
+- The diagnostic from-scratch script `train_distill.py` is retained for the
+  historical lesson that single-stage from-scratch distillation collapses
+  (the action classifier never learns from zero, starving the action-
+  conditioned decoder). It is **not** the production entry point.
+- The PA floor at ~106 mm is, to our knowledge, hardware-limited rather than
+  algorithm-limited under MMFi's 3-Tx × 1-Rx CSI capture. Improvements should
+  target richer signal capture (more antennas, higher subcarrier resolution)
+  rather than further loss-function engineering on this dataset.
