@@ -71,9 +71,109 @@ from models.depth_teacher import DepthPoseTeacher
 from losses import TotalLoss, PoseLoss
 from evaluate import PoseEvaluator
 from dataset_distill import MMFiDistillDataset
-from distill_loss import DistillProjection, FeatureDistillLoss, OutputDistillLoss
+from distill_loss import (DistillProjection, FeatureDistillLoss, OutputDistillLoss,
+                          KinematicPriorLoss)
 from utils import (set_seed, setup_logger, count_parameters,
                    save_checkpoint, AverageMeter, Timer, save_run_config)
+
+
+### ---------------------------------------------------------------------
+### EMA (Exponential Moving Average) — added to fight training oscillation
+### ---------------------------------------------------------------------
+### Empirical motivation: prior runs (both distill and baseline) showed massive
+### MPJPE oscillation between consecutive evals (~±100mm), causing best-MPJPE
+### and best-PA to fall on different epochs. EMA averages parameters across
+### the last ~1/(1-decay) optimizer steps, smoothing the model trajectory and
+### typically letting both metrics co-locate at the same checkpoint.
+###
+### v2 lesson: with constant decay=0.999, EMA shadow takes ~6 epochs to catch
+### up to the rapidly-evolving model, producing nonsense evals (e.g. MPJPE
+### 907mm at epoch 3) in early training. Fix: standard decay-warmup schedule
+###     decay_t = min(target_decay, (1 + t) / (10 + t))
+### which gives decay ≈ 0.1 at t=0, ≈ 0.99 at t=1000, ≈ target at t=10000.
+### Shadow tracks model tightly when stale, locks down once stabilized.
+###
+### With target_decay=0.999 and ~405 optimizer steps/epoch, the schedule
+### reaches 0.99 in ~2.5 epochs and 0.999 in ~25 epochs (functionally equivalent
+### to the un-scheduled version once past warmup).
+class EMA:
+    """Exponential moving average of student parameters with decay warmup.
+
+    Update rule (every optimizer step):
+        decay_t  = min(target_decay, (1 + t) / (10 + t))    # warmup schedule
+        shadow[n] := decay_t * shadow[n] + (1 - decay_t) * model[n]
+
+    Eval-time pattern:
+        ema.apply_to(model)
+        try:
+            metrics = evaluate(model, ...)
+        finally:
+            ema.restore(model)
+
+    Only `requires_grad=True` parameters are tracked. Buffers (BatchNorm/LN
+    running stats) are kept from the live model — typically what people want.
+
+    Setting `warmup=False` reverts to constant decay (v1/v2 behavior, kept
+    for ablation only).
+    """
+    def __init__(self, model, decay=0.999, warmup=True):
+        self.target_decay = decay
+        self.warmup = warmup
+        self.num_updates = 0
+        self.shadow = {}
+        self.backup = None
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.detach().clone()
+
+    def _current_decay(self):
+        """Decay schedule: linearly approaches target_decay during warmup."""
+        if not self.warmup:
+            return self.target_decay
+        # Standard formula used by TF/JAX/timm: min(target, (1+t)/(10+t))
+        return min(self.target_decay,
+                   (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = self._current_decay()
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def apply_to(self, model):
+        """Swap shadow into model in-place; keep original for restore()."""
+        assert self.backup is None, "EMA.apply_to() called without prior restore()"
+        self.backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.backup[n] = p.detach().clone()
+                p.data.copy_(self.shadow[n])
+
+    @torch.no_grad()
+    def restore(self, model):
+        """Undo apply_to(): restore the pre-swap weights."""
+        assert self.backup is not None, "EMA.restore() called without prior apply_to()"
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = None
+
+    def state_dict(self):
+        return {
+            'target_decay': self.target_decay,
+            'warmup': self.warmup,
+            'num_updates': self.num_updates,
+            'shadow': self.shadow,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.target_decay = state_dict['target_decay']
+        self.warmup = state_dict.get('warmup', True)
+        self.num_updates = state_dict.get('num_updates', 0)
+        self.shadow = state_dict['shadow']
 
 
 # Backbone modules = pretrained from Stage1B (low LR, fine-tune)
@@ -219,18 +319,20 @@ def build_loaders(args):
 # ----------------------------------------------------------------------
 def train_one_epoch(student, proj, teacher, loader, optimizer,
                     total_loss_fn, pose_loss_fn, feat_distill_fn, out_distill_fn,
-                    device, epoch, logger, args):
+                    device, epoch, logger, args, ema=None, kine_prior_fn=None):
     student.train()
     proj.train()
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_pose_masked', 'l_cons', 'l_action',
-               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm']}
+               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm',
+               'l_kine', 'l_kine_bone_mm']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
 
     use_feat = args.lambda_feat > 0
     use_out  = args.lambda_out  > 0
+    use_kine = getattr(args, 'lambda_kine', 0) > 0 and kine_prior_fn is not None
 
     for i, batch in enumerate(loader):
         csi      = batch['csi'].to(device)
@@ -269,6 +371,13 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                 meters['l_distill_out'].update(od['l_distill_out'], csi.shape[0])
                 meters['l_distill_out_mm'].update(od['l_distill_out_mm'], csi.shape[0])
 
+        # Kinematic prior (vs GT, no teacher needed — outside the use_feat/use_out block)
+        if use_kine:
+            l_kine, kd = kine_prior_fn(outputs['p_final_clean'], pose_3d)
+            total = total + args.lambda_kine * l_kine
+            meters['l_kine'].update(kd['l_kine'], csi.shape[0])
+            meters['l_kine_bone_mm'].update(kd['l_kine_bone_mm'], csi.shape[0])
+
         (total / accum).backward()
 
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
@@ -278,6 +387,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                     args.grad_clip)
             optimizer.step()
             optimizer.zero_grad()
+            if ema is not None:
+                ema.update(student)
 
         B = csi.shape[0]
         meters['loss'].update(total.item(), B)
@@ -296,6 +407,9 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
+            if use_kine:
+                msg += (f' Kine: {meters["l_kine"].avg:.4f}'
+                        f' (bone~{meters["l_kine_bone_mm"].avg:.0f}mm)')
             logger.info(msg)
 
         del outputs, total
@@ -310,7 +424,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
 # Evaluate (same as train.py — CSI-only, action_idx=None)
 # ----------------------------------------------------------------------
 @torch.no_grad()
-def evaluate(student, test_loader, device, evaluator, logger):
+def evaluate(student, test_loader, device, evaluator, logger, tag=''):
     student.eval()
     all_preds, all_gts = [], []
     action_correct, action_total = 0, 0
@@ -333,7 +447,7 @@ def evaluate(student, test_loader, device, evaluator, logger):
     pred_std = preds.mean(dim=1).std(dim=0).mean().item() * 1000
     acc = 100.0 * action_correct / max(action_total, 1)
     logger.info(
-        f'[Eval] MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
+        f'[Eval{tag}] MPJPE: {metrics["MPJPE (mm)"]:.2f}mm | '
         f'MPJPE_a: {metrics["MPJPE_aligned (mm)"]:.2f}mm | '
         f'PA: {metrics["PA-MPJPE (mm)"]:.2f}mm | '
         f'P50n: {metrics["PCK@50_norm (%)"]:.1f}% | '
@@ -342,6 +456,24 @@ def evaluate(student, test_loader, device, evaluator, logger):
     metrics['pred_std'] = pred_std
     metrics['action_acc'] = acc
     return metrics
+
+
+@torch.no_grad()
+def evaluate_with_ema(student, ema, test_loader, device, evaluator, logger):
+    """Evaluate both raw student and EMA student, return both metric dicts.
+
+    EMA evaluation swaps shadow weights into the model in-place, evaluates,
+    and restores. This is safe across exceptions due to try/finally.
+    """
+    m_raw = evaluate(student, test_loader, device, evaluator, logger, tag=' raw')
+    if ema is None:
+        return m_raw, None
+    ema.apply_to(student)
+    try:
+        m_ema = evaluate(student, test_loader, device, evaluator, logger, tag=' EMA')
+    finally:
+        ema.restore(student)
+    return m_raw, m_ema
 
 
 # ----------------------------------------------------------------------
@@ -366,6 +498,14 @@ def get_args():
                    help='Feature distill weight (z_global alignment)')
     p.add_argument('--lambda_out',  type=float, default=0.5,
                    help='Output distill weight (pose alignment, targets MPJPE)')
+    p.add_argument('--lambda_kine', type=float, default=0.5,
+                   help='Kinematic prior weight (bone-length vs GT + symmetry, '
+                        'targets PA-MPJPE). 0 disables. Scale/translation '
+                        'invariant so MPJPE-neutral.')
+    p.add_argument('--kine_bone_w', type=float, default=1.0,
+                   help='Bone-length-vs-GT sub-weight inside kinematic prior')
+    p.add_argument('--kine_sym_w', type=float, default=0.3,
+                   help='Bilateral symmetry sub-weight inside kinematic prior')
     p.add_argument('--distill_cos_w', type=float, default=1.0)
     p.add_argument('--distill_sl1_w', type=float, default=1.0)
     p.add_argument('--out_distill_beta', type=float, default=0.05,
@@ -414,6 +554,21 @@ def get_args():
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--patience', type=int, default=15)
     p.add_argument('--eval_interval', type=int, default=3)
+    # EMA — added to combat MPJPE oscillation seen in v1 runs
+    p.add_argument('--use_ema', action='store_true', default=True,
+                   help='Maintain EMA of student weights and evaluate it each '
+                        'eval cycle (default: ON). --no_ema disables.')
+    p.add_argument('--no_ema', dest='use_ema', action='store_false',
+                   help='Disable EMA (run like the original v1).')
+    p.add_argument('--ema_decay', type=float, default=0.999,
+                   help='Target EMA decay. With decay=d and ~405 opt-steps/epoch, '
+                        'effective averaging window ≈ 1/(1-d) steps ≈ '
+                        '1/(1-d)/405 epochs. 0.999 ≈ 2.5 epochs.')
+    p.add_argument('--ema_no_warmup', dest='ema_warmup', action='store_false',
+                   default=True,
+                   help='Disable decay warmup schedule (v2 EMA had constant '
+                        'decay; gave 5-epoch garbage period at start). Default: '
+                        'warmup ON, fixed via min(target_decay, (1+t)/(10+t)).')
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', type=str, default='cuda')
@@ -494,6 +649,9 @@ def main():
         hip_weight=args.out_distill_hip_weight,
         num_joints=args.num_joints,
         hip_joint_idx=0).to(device)
+    kine_prior_fn = KinematicPriorLoss(
+        bone_weight=args.kine_bone_w,
+        sym_weight=args.kine_sym_w).to(device)
     evaluator = PoseEvaluator(unit='meter')
 
     # ---- optimizer (differential LR)
@@ -510,7 +668,47 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     timer = Timer(); timer.start()
-    best_mpjpe = float('inf'); best_pa = float('inf'); patience = 0
+
+    # ---- EMA (optional; on by default — combats v1's MPJPE oscillation)
+    ema = None
+    if args.use_ema:
+        ema = EMA(student, decay=args.ema_decay, warmup=args.ema_warmup)
+        win_eps = 1.0 / (1.0 - args.ema_decay) / 405
+        logger.info(f'EMA: ON (target_decay={args.ema_decay}, warmup={args.ema_warmup}; '
+                    f'effective window ≈ {win_eps:.1f} epochs at 405 opt-steps/epoch)')
+        if args.ema_warmup:
+            logger.info(f'  decay schedule: min(target, (1+t)/(10+t)) — '
+                        f'reaches 0.99 at step ~1000 (~2.5 epochs), '
+                        f'target at step ~10000 (~25 epochs)')
+    else:
+        logger.info('EMA: OFF (--no_ema)')
+
+    # ---- Pareto multi-checkpoint tracking
+    # Prior runs showed best-MPJPE and best-PA epochs diverge — saving the
+    # MPJPE-only "best" throws away the model that's good at PA. Track and
+    # save all four winners so we can pick the best Pareto point afterwards.
+    best = {'raw_mpjpe': float('inf'), 'raw_pa': float('inf'),
+            'ema_mpjpe': float('inf'), 'ema_pa': float('inf')}
+    best_epoch = {'raw_mpjpe': 0, 'raw_pa': 0, 'ema_mpjpe': 0, 'ema_pa': 0}
+    best_pa_at_best_mpjpe = {'raw': float('inf'), 'ema': float('inf')}
+    best_mpjpe_at_best_pa = {'raw': float('inf'), 'ema': float('inf')}
+    patience = 0
+
+    def _save_ckpt(name, metrics, use_ema_weights=False):
+        """Save current model state under given name. If use_ema_weights,
+        apply EMA shadow weights first, then restore."""
+        path = os.path.join(args.save_dir, f'{name}.pth')
+        if use_ema_weights and ema is not None:
+            ema.apply_to(student)
+            try:
+                save_checkpoint(student, optimizer, epoch, metrics, path)
+            finally:
+                ema.restore(student)
+        else:
+            save_checkpoint(student, optimizer, epoch, metrics, path)
+        # also dump the projection state alongside
+        torch.save({'epoch': epoch, 'proj_state_dict': proj.state_dict()},
+                   os.path.join(args.save_dir, f'{name}_proj.pth'))
 
     for epoch in range(1, args.epochs + 1):
         cur_lrs = [g['lr'] for g in optimizer.param_groups]
@@ -520,7 +718,8 @@ def main():
         tm = train_one_epoch(student, proj, teacher, train_loader, optimizer,
                              total_loss_fn, pose_loss_fn,
                              feat_distill_fn, out_distill_fn,
-                             device, epoch, logger, args)
+                             device, epoch, logger, args, ema=ema,
+                             kine_prior_fn=kine_prior_fn)
         line = (f'[Train] Epoch {epoch} | Loss: {tm["loss"]:.4f} '
                 f'Pose(C): {tm["l_pose_clean"]:.4f} '
                 f'Act: {tm["l_action"]:.4f}')
@@ -528,26 +727,61 @@ def main():
             line += f' Feat: {tm["l_distill_feat"]:.4f}'
         if args.lambda_out > 0:
             line += f' Out: {tm["l_distill_out"]:.4f} (~{tm["l_distill_out_mm"]:.0f}mm)'
+        if getattr(args, 'lambda_kine', 0) > 0:
+            line += f' Kine: {tm["l_kine"]:.4f} (bone~{tm["l_kine_bone_mm"]:.0f}mm)'
         line += f' | {timer.elapsed_str()}'
         logger.info(line)
         scheduler.step()
 
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
-            m = evaluate(student, test_loader, device, evaluator, logger)
-            cur = m['MPJPE (mm)']
-            if cur < best_mpjpe:
-                best_mpjpe = cur
-                best_pa = m['PA-MPJPE (mm)']
+            m_raw, m_ema = evaluate_with_ema(
+                student, ema, test_loader, device, evaluator, logger)
+
+            improved = False
+
+            # raw bests
+            if m_raw['MPJPE (mm)'] < best['raw_mpjpe']:
+                best['raw_mpjpe'] = m_raw['MPJPE (mm)']
+                best_epoch['raw_mpjpe'] = epoch
+                best_pa_at_best_mpjpe['raw'] = m_raw['PA-MPJPE (mm)']
+                _save_ckpt('best_mpjpe_raw', m_raw, use_ema_weights=False)
+                logger.info(f'  ** NEW best_mpjpe_raw: {best["raw_mpjpe"]:.2f}mm '
+                            f'(PA at this epoch: {m_raw["PA-MPJPE (mm)"]:.2f}mm)')
+                improved = True
+            if m_raw['PA-MPJPE (mm)'] < best['raw_pa']:
+                best['raw_pa'] = m_raw['PA-MPJPE (mm)']
+                best_epoch['raw_pa'] = epoch
+                best_mpjpe_at_best_pa['raw'] = m_raw['MPJPE (mm)']
+                _save_ckpt('best_pa_raw', m_raw, use_ema_weights=False)
+                logger.info(f'  ** NEW best_pa_raw: {best["raw_pa"]:.2f}mm '
+                            f'(MPJPE at this epoch: {m_raw["MPJPE (mm)"]:.2f}mm)')
+                improved = True
+
+            # EMA bests
+            if m_ema is not None:
+                if m_ema['MPJPE (mm)'] < best['ema_mpjpe']:
+                    best['ema_mpjpe'] = m_ema['MPJPE (mm)']
+                    best_epoch['ema_mpjpe'] = epoch
+                    best_pa_at_best_mpjpe['ema'] = m_ema['PA-MPJPE (mm)']
+                    _save_ckpt('best_mpjpe_ema', m_ema, use_ema_weights=True)
+                    logger.info(f'  ** NEW best_mpjpe_ema: {best["ema_mpjpe"]:.2f}mm '
+                                f'(PA at this epoch: {m_ema["PA-MPJPE (mm)"]:.2f}mm)')
+                    improved = True
+                if m_ema['PA-MPJPE (mm)'] < best['ema_pa']:
+                    best['ema_pa'] = m_ema['PA-MPJPE (mm)']
+                    best_epoch['ema_pa'] = epoch
+                    best_mpjpe_at_best_pa['ema'] = m_ema['MPJPE (mm)']
+                    _save_ckpt('best_pa_ema', m_ema, use_ema_weights=True)
+                    logger.info(f'  ** NEW best_pa_ema: {best["ema_pa"]:.2f}mm '
+                                f'(MPJPE at this epoch: {m_ema["MPJPE (mm)"]:.2f}mm)')
+                    improved = True
+
+            if improved:
                 patience = 0
-                save_checkpoint(student, optimizer, epoch, m,
-                                os.path.join(args.save_dir, 'best_model.pth'))
-                torch.save({'epoch': epoch, 'proj_state_dict': proj.state_dict()},
-                           os.path.join(args.save_dir, 'proj_best.pth'))
-                logger.info(f'*** NEW BEST MPJPE: {best_mpjpe:.2f}mm  '
-                            f'PA: {best_pa:.2f}mm ***')
             else:
                 patience += 1
-                logger.info(f'No improvement. Patience: {patience}/{args.patience}')
+                logger.info(f'  No improvement on any of 4 fronts. '
+                            f'Patience: {patience}/{args.patience}')
             if patience >= args.patience:
                 logger.info(f'Early stopping at epoch {epoch}')
                 break
@@ -557,10 +791,18 @@ def main():
                             os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pth'))
 
     logger.info('\n' + '=' * 70)
-    logger.info(f'Step B+ done.  Best MPJPE: {best_mpjpe:.2f}mm  '
-                f'PA: {best_pa:.2f}mm  |  Time: {timer.elapsed_str()}')
+    logger.info('Step B+ done.  Summary of 4 Pareto-frontier checkpoints:')
+    logger.info(f'  best_mpjpe_raw : MPJPE {best["raw_mpjpe"]:7.2f}mm '
+                f'(PA {best_pa_at_best_mpjpe["raw"]:7.2f}mm) @ epoch {best_epoch["raw_mpjpe"]}')
+    logger.info(f'  best_pa_raw    : PA    {best["raw_pa"]:7.2f}mm '
+                f'(MPJPE {best_mpjpe_at_best_pa["raw"]:7.2f}mm) @ epoch {best_epoch["raw_pa"]}')
+    if ema is not None:
+        logger.info(f'  best_mpjpe_ema : MPJPE {best["ema_mpjpe"]:7.2f}mm '
+                    f'(PA {best_pa_at_best_mpjpe["ema"]:7.2f}mm) @ epoch {best_epoch["ema_mpjpe"]}')
+        logger.info(f'  best_pa_ema    : PA    {best["ema_pa"]:7.2f}mm '
+                    f'(MPJPE {best_mpjpe_at_best_pa["ema"]:7.2f}mm) @ epoch {best_epoch["ema_pa"]}')
+    logger.info(f'Time: {timer.elapsed_str()}')
     logger.info('Targets to beat: DT-Pose MPJPE=316.8 / PA=104.2 (MMFi P3-Setting3)')
-    logger.info('Baseline (no distill) at same hyperparams: MPJPE≈345 / PA≈104')
 
 
 if __name__ == '__main__':
