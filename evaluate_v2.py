@@ -179,13 +179,51 @@ _ENV_SUBJECTS = {
 }
 
 
+# --- 纯 numpy CSI 预处理 (复刻 dataset.CSIPreprocessor, 但去趋势用闭式解) ---
+def _detrend_linear_np(x):
+    """沿最后一维线性去趋势, 纯 numpy 闭式最小二乘。
+    与 scipy.signal.detrend(type='linear') 逐元素一致 (误差 ~1e-15), 不碰 LAPACK。"""
+    x = np.asarray(x, dtype=np.float64)
+    N = x.shape[-1]
+    t = np.arange(N, dtype=np.float64)
+    tc = t - t.mean()
+    denom = (tc * tc).sum()
+    xm = x.mean(axis=-1, keepdims=True)
+    slope = (tc * (x - xm)).sum(axis=-1, keepdims=True) / (denom + 1e-12)
+    return (x - (slope * tc + xm))
+
+
+def _normalize_amplitude_np(amp):
+    amin = amp.min(axis=(-2, -1), keepdims=True)
+    amax = amp.max(axis=(-2, -1), keepdims=True)
+    denom = amax - amin
+    denom = np.where(denom < 1e-8, 1.0, denom)
+    return np.nan_to_num((amp - amin) / denom, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _process_phase_np(phase):
+    pu = np.unwrap(phase, axis=-2)
+    shape = pu.shape
+    pf = pu.reshape(-1, shape[-2])              # 与 CSIPreprocessor 同样的 reshape
+    pd = _detrend_linear_np(pf).reshape(shape)
+    sin_p, cos_p = np.sin(pd), np.cos(pd)
+    return np.nan_to_num(np.concatenate([sin_p, cos_p], axis=1), nan=0.0)
+
+
+def _preprocess_csi(amp, phase):
+    """amp/phase: (T,3,114,10) -> (T,9,114,10) float32。等价于 CSIPreprocessor.preprocess。"""
+    amp_norm = _normalize_amplitude_np(np.nan_to_num(amp.astype(np.float32)))
+    phase_enc = _process_phase_np(np.nan_to_num(phase.astype(np.float32)))
+    return np.concatenate([amp_norm, phase_enc], axis=1).astype(np.float32)
+
+
 def iter_env_sequences(data_root, env, seq_len=64, num_actions=27):
     """按 (subject, action) 逐段 yield (seq_id, csi_full, gt_full)。
     csi_full: (T_total, 9, 114, 10) float32 ; gt_full: (T_total, 17, 3) (米)。
-    预处理与 dataset.MMFiDataset 完全一致 (复用 CSIPreprocessor)。"""
+    预处理与 dataset.CSIPreprocessor 逐元素一致, 但用纯 numpy 的去趋势
+    (闭式最小二乘), 不走 scipy.signal.detrend -> LAPACK, 因此不受某些
+    scipy/numpy/BLAS 构建上 lstsq 崩溃 ('illegal value ... internal None') 的影响。"""
     from scipy.io import loadmat
-    from dataset import CSIPreprocessor          # 与训练同一套预处理
-    pre = CSIPreprocessor()
 
     for sid in _ENV_SUBJECTS.get(env, []):
         subj = f'S{sid:02d}'
@@ -209,7 +247,8 @@ def iter_env_sequences(data_root, env, seq_len=64, num_actions=27):
                 else:
                     amps.append(np.zeros((3, 114, 10), np.float32))
                     phases.append(np.zeros((3, 114, 10), np.float32))
-            csi = pre.preprocess(np.stack(amps), np.stack(phases))   # (n,9,114,10)
+            # 纯 numpy 预处理整段序列 (与 CSIPreprocessor 逐元素一致, 不碰 scipy detrend)
+            csi = _preprocess_csi(np.stack(amps), np.stack(phases))  # (n,9,114,10)
             gt = np.load(gt_path).astype(np.float32)[:n]             # (n,17,3)
             yield f'{env}/{subj}/{act}', csi, gt
 
