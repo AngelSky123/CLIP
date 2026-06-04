@@ -42,6 +42,8 @@ from distill_loss import DistillProjection, FeatureDistillLoss, OutputDistillLos
 from utils import (set_seed, setup_logger, count_parameters,
                    save_checkpoint, AverageMeter, Timer, save_run_config)
 
+from taskprompt_decoder import uniformity_loss
+
 try:
     from evaluate_v2 import evaluate_v2 as _evaluate_v2
     _HAS_EVAL_V2 = True
@@ -213,6 +215,10 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         base_loss, loss_dict = total_loss_fn(outputs, pose_3d, training=True,
                                              action_loss=action_loss)
         total = base_loss
+        # === 新增: uniformity 正则 (反 dimensional collapse) ===
+        l_unif = uniformity_loss(outputs['z_global'])
+        total = total + args.lambda_unif * l_unif
+        # === 蒸馏项 (原有) ===
         if use_feat or use_out:
             teacher_out = teacher(depth)
             if use_feat:
@@ -358,6 +364,7 @@ def get_args():
     p.add_argument('--no_ema', dest='use_ema', action='store_false')
     p.add_argument('--ema_decay', type=float, default=0.999)
     p.add_argument('--ema_no_warmup', action='store_true', default=False)
+    p.add_argument('--lambda_unif', type=float, default=0.05)
     return p.parse_args()
 
 

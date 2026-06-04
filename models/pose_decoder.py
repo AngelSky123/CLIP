@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from taskprompt_decoder import TaskPromptCoarseHead
 
 H36M_BONES = [
     (0, 1), (1, 2), (2, 3),
@@ -126,7 +127,10 @@ class PoseDecoder(nn.Module):
     def __init__(self, in_dim=256, hidden_dim=512, gcn_hidden=128,
                  num_gcn_layers=3, num_joints=17, action_embed_dim=32):
         super().__init__()
-        self.coarse_head = CoarsePoseHead(
+        # self.coarse_head = CoarsePoseHead(
+        #     in_dim, hidden_dim, num_joints, action_embed_dim
+        # )
+        self.coarse_head = TaskPromptCoarseHead(
             in_dim, hidden_dim, num_joints, action_embed_dim
         )
         self.refiner = SkeletonRefiner(

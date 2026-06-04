@@ -22,6 +22,7 @@ from .csi_encoder import DualBranchCSIEncoder
 from .local_encoder import LocalSpatioTemporalEncoder, LocalFeaturePooling
 from .global_encoder import GlobalTemporalModeler
 from .pose_decoder import PoseDecoder, ActionClassifier
+from root_decoupled_decoder import RootDecoupledPoseDecoder
 
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
@@ -92,12 +93,9 @@ class CSIRSCPoseDG(nn.Module):
 
         # ------ 初始化 Decoder & Classifier ------
         self.pose_decoder = PoseDecoder(
-            in_dim=args.global_dim,
-            hidden_dim=args.coarse_hidden_dim,
-            gcn_hidden=args.gcn_hidden_dim,
-            num_gcn_layers=args.num_gcn_layers,
-            num_joints=args.num_joints,
-            action_embed_dim=action_embed_dim,
+            in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
+            gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
+            num_joints=args.num_joints, action_embed_dim=action_embed_dim,
         )
         self.action_classifier = ActionClassifier(
             in_dim=args.global_dim,
