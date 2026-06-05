@@ -1,10 +1,13 @@
 """
 CSI-RSC-PoseDG v7.1 — Action-Conditioned Pose Decoder (Fixed)
   + v8.x: optional ImageNet vision backbone front-end (use_vision_backbone).
+  + 路1: ActionPriorPoseDecoder (动作×相位先验 root), 透传 action_probs。
 
 核心修正:
 1. 修复计算图断裂 (Detach Bug): 真正启用 RSCGlobalChallenger，确保 Mask 操作保留 Backbone 梯度。
 2. 动作特征随机失活 (Action Dropout): 训练时 50% 概率阻断 Action 先验，彻底解决跨域时的级联失效。
+3. 路1: pose_decoder 换成 ActionPriorPoseDecoder。它额外需要 action_probs (动作软概率),
+   所有 forward_decoder 调用都透传 action_probs。
 
 NEW — Vision backbone option:
   If args.use_vision_backbone is True, the (csi_encoder + local_encoder +
@@ -21,8 +24,10 @@ import torch.nn.functional as F
 from .csi_encoder import DualBranchCSIEncoder
 from .local_encoder import LocalSpatioTemporalEncoder, LocalFeaturePooling
 from .global_encoder import GlobalTemporalModeler
+# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 留着不碍事
 from .pose_decoder import PoseDecoder, ActionClassifier
-from root_decoupled_decoder import RootDecoupledPoseDecoder
+# 路1: 动作×相位先验解码器
+from action_prior_root import ActionPriorPoseDecoder
 
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
@@ -92,10 +97,12 @@ class CSIRSCPoseDG(nn.Module):
         )
 
         # ------ 初始化 Decoder & Classifier ------
-        self.pose_decoder = PoseDecoder(
+        # 路1: 动作×相位先验解码器 (接口比原 PoseDecoder 多一个 action_probs 参数)
+        self.pose_decoder = ActionPriorPoseDecoder(
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,
+            num_actions=args.num_actions, residual_scale=0.3,
         )
         self.action_classifier = ActionClassifier(
             in_dim=args.global_dim,
@@ -118,25 +125,28 @@ class CSIRSCPoseDG(nn.Module):
         z_global = self.global_modeler(z_pooled)
         return z_local, z_global
 
-    def forward_decoder(self, z_global, action_emb):
-        return self.pose_decoder(z_global, action_emb)
+    def forward_decoder(self, z_global, action_emb, action_probs=None):
+        # 路1: 透传 action_probs 给 ActionPriorPoseDecoder
+        return self.pose_decoder(z_global, action_emb, action_probs)
 
     def forward(self, csi, action_idx=None):
         """Standard forward pass (推理模式)."""
         z_local, z_global = self.forward_backbone(csi)
         action_logits = self.action_classifier(z_global)
 
+        # action_probs 两个分支都要有, 传给 ActionPriorPoseDecoder 做先验锚点
+        action_probs = F.softmax(action_logits, dim=-1)
+
         if action_idx is not None:
             action_emb = self.action_classifier.get_action_embedding(
                 action_idx=action_idx
             )
         else:
-            action_probs = F.softmax(action_logits, dim=-1)
             action_emb = self.action_classifier.get_action_embedding(
                 action_probs=action_probs
             )
 
-        p_coarse, p_final = self.forward_decoder(z_global, action_emb)
+        p_coarse, p_final = self.forward_decoder(z_global, action_emb, action_probs)
 
         return {
             'p_coarse': p_coarse,
@@ -153,13 +163,16 @@ class CSIRSCPoseDG(nn.Module):
 
         # 动作分类与 Embedding
         action_logits = self.action_classifier(z_global_raw)
+        # action_probs 始终算出来, 喂给先验 root (与 action_emb 的 dropout 无关)
+        action_probs = F.softmax(action_logits, dim=-1)
         if action_idx is not None:
             action_emb = self.action_classifier.get_action_embedding(action_idx)
         else:
-            action_probs = F.softmax(action_logits, dim=-1)
             action_emb = self.action_classifier.get_action_embedding(action_probs=action_probs)
 
         # === 修复 2：Action Dropout (动作特征解耦) ===
+        # 注意: 只 dropout action_emb (相对骨架的动作条件), 不 dropout action_probs
+        # (全局位置先验是独立机制, 始终保留)。
         if self.training and torch.rand(1).item() < 0.5:
             action_emb_for_decoder = torch.zeros_like(action_emb)
         else:
@@ -167,13 +180,13 @@ class CSIRSCPoseDG(nn.Module):
 
         # Step 2A: 干净路径 (主图，负责传递绝大部分基础梯度)
         p_coarse_clean, p_final_clean = self.forward_decoder(
-            z_global_raw, action_emb_for_decoder
+            z_global_raw, action_emb_for_decoder, action_probs
         )
 
         # Step 3: RSC 梯度计算 (在分离的图上寻找主导特征)
         z_global_detached = z_global_raw.detach().clone().requires_grad_(True)
         _, p_final_for_grad = self.forward_decoder(
-            z_global_detached, action_emb_for_decoder.detach()
+            z_global_detached, action_emb_for_decoder.detach(), action_probs.detach()
         )
 
         loss_for_grad = loss_fn(p_final_for_grad, pose_3d)
@@ -199,7 +212,7 @@ class CSIRSCPoseDG(nn.Module):
 
         # Step 5: 被 Mask 后的解码 (迫使网络发掘次优特征)
         p_coarse_masked, p_final_masked = self.forward_decoder(
-            z_global_masked, action_emb_for_decoder.detach()
+            z_global_masked, action_emb_for_decoder.detach(), action_probs.detach()
         )
 
         return {

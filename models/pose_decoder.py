@@ -7,12 +7,14 @@ Module 8: 3D 姿态解码头 v2 — 动作条件化
 
 这从架构上保证不同动作产生不同预测:
   decoder(z_global, action_A01) ≠ decoder(z_global, action_A15)
+
+注: CoarsePoseHead / SkeletonRefiner 被 action_prior_root.py 复用,
+    请勿删除或改名。
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from taskprompt_decoder import TaskPromptCoarseHead
 
 H36M_BONES = [
     (0, 1), (1, 2), (2, 3),
@@ -43,7 +45,7 @@ def build_adjacency_matrix(num_joints=17, bones=None, self_loop=True):
 
 class CoarsePoseHead(nn.Module):
     """动作条件化粗姿态头.
-    
+
     输入: z_global (B,T,C_g) + action_emb (B,D_a)
     输出: P_coarse (B,T,17,3)
     """
@@ -119,7 +121,7 @@ class SkeletonRefiner(nn.Module):
 
 class PoseDecoder(nn.Module):
     """动作条件化姿态解码器.
-    
+
     输入: z_global (B,T,C_g), action_emb (B,D_a)
     输出: P_coarse, P_final (B,T,17,3)
     """
@@ -127,10 +129,7 @@ class PoseDecoder(nn.Module):
     def __init__(self, in_dim=256, hidden_dim=512, gcn_hidden=128,
                  num_gcn_layers=3, num_joints=17, action_embed_dim=32):
         super().__init__()
-        # self.coarse_head = CoarsePoseHead(
-        #     in_dim, hidden_dim, num_joints, action_embed_dim
-        # )
-        self.coarse_head = TaskPromptCoarseHead(
+        self.coarse_head = CoarsePoseHead(
             in_dim, hidden_dim, num_joints, action_embed_dim
         )
         self.refiner = SkeletonRefiner(
@@ -166,7 +165,7 @@ class ActionClassifier(nn.Module):
 
     def get_action_embedding(self, action_idx=None, action_probs=None):
         """Get action embedding vector.
-        
+
         Args:
             action_idx: (B,) integer action indices (for training with GT)
             action_probs: (B, num_actions) soft probabilities (for inference)

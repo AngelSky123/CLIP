@@ -42,7 +42,8 @@ from distill_loss import DistillProjection, FeatureDistillLoss, OutputDistillLos
 from utils import (set_seed, setup_logger, count_parameters,
                    save_checkpoint, AverageMeter, Timer, save_run_config)
 
-from taskprompt_decoder import uniformity_loss
+from action_prior_root import root_prior_losses
+
 
 try:
     from evaluate_v2 import evaluate_v2 as _evaluate_v2
@@ -195,7 +196,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
     student.train(); proj.train()
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_cons', 'l_action',
-               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm']}
+               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm', 'l_root_prior']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
@@ -215,9 +216,13 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         base_loss, loss_dict = total_loss_fn(outputs, pose_3d, training=True,
                                              action_loss=action_loss)
         total = base_loss
-        # === 新增: uniformity 正则 (反 dimensional collapse) ===
-        l_unif = uniformity_loss(outputs['z_global'])
-        total = total + args.lambda_unif * l_unif
+        # === 路1: 动作×相位先验监督 + 残差幅度惩罚 ===
+        _m = student.module if hasattr(student, 'module') else student
+        l_root, root_d = root_prior_losses(
+            _m.pose_decoder, outputs['p_final_clean'], pose_3d, action_labels,
+            lambda_res=args.lambda_res)
+        total = total + args.lambda_root_prior * l_root
+        meters['l_root_prior'].update(root_d['l_prior'], csi.shape[0])
         # === 蒸馏项 (原有) ===
         if use_feat or use_out:
             teacher_out = teacher(depth)
@@ -364,7 +369,9 @@ def get_args():
     p.add_argument('--no_ema', dest='use_ema', action='store_false')
     p.add_argument('--ema_decay', type=float, default=0.999)
     p.add_argument('--ema_no_warmup', action='store_true', default=False)
-    p.add_argument('--lambda_unif', type=float, default=0.05)
+
+    p.add_argument('--lambda_root_prior', type=float, default=1.0)
+    p.add_argument('--lambda_res',         type=float, default=0.1)
     return p.parse_args()
 
 
