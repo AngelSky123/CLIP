@@ -43,6 +43,7 @@ from utils import (set_seed, setup_logger, count_parameters,
                    save_checkpoint, AverageMeter, Timer, save_run_config)
 
 from action_prior_root import root_prior_losses
+from structural_losses import structural_loss
 
 
 try:
@@ -196,7 +197,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
     student.train(); proj.train()
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_cons', 'l_action',
-               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm', 'l_root_prior']}
+               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm', 'l_root_prior',
+               'l_struct']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
@@ -236,6 +238,12 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                 total = total + args.lambda_out * l_out
                 meters['l_distill_out'].update(od['l_distill_out'], csi.shape[0])
                 meters['l_distill_out_mm'].update(od['l_distill_out_mm'], csi.shape[0])
+        # === 结构正则: 骨长(对GT) + 左右对称 + 时序骨长稳定 (只动相对骨架, 不碰 root) ===
+        l_struct, struct_d = structural_loss(
+            outputs['p_final_clean'], pose_3d,
+            w_bone=args.w_bone, w_sym=args.w_sym, w_temp=args.w_temp)
+        total = total + l_struct
+        meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
         (total / accum).backward()
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
             if args.grad_clip > 0:
@@ -251,6 +259,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         if (i + 1) % args.log_interval == 0:
             msg = (f'Epoch [{epoch}] Batch [{i+1}/{len(loader)}] Loss: {meters["loss"].avg:.4f} '
                    f'Pose(C): {meters["l_pose_clean"].avg:.4f} Act: {meters["l_action"].avg:.4f}')
+            msg += f' Struct: {meters["l_struct"].avg:.4f}'
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
@@ -372,6 +381,11 @@ def get_args():
 
     p.add_argument('--lambda_root_prior', type=float, default=1.0)
     p.add_argument('--lambda_res',         type=float, default=0.1)
+
+    p.add_argument('--w_bone', type=float, default=0.5)
+    p.add_argument('--w_sym',  type=float, default=0.1)
+    p.add_argument('--w_temp', type=float, default=0.1)
+
     return p.parse_args()
 
 
@@ -381,6 +395,8 @@ def get_args():
 def main():
     args = get_args()
     set_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     save_run_config(args, args.save_dir, extra={"script": "train_distill_pretrained", "step": "B+v3"})
 

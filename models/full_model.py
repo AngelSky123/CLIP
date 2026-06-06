@@ -1,13 +1,12 @@
 """
 CSI-RSC-PoseDG v7.1 — Action-Conditioned Pose Decoder (Fixed)
   + v8.x: optional ImageNet vision backbone front-end (use_vision_backbone).
-  + 路1: ActionPriorPoseDecoder (动作×相位先验 root), 透传 action_probs。
+  [ROLLBACK] 退回 366 基线: pose_decoder = PoseDecoder (coarse_head=TaskPromptCoarseHead),
+             已移除路1的 ActionPriorPoseDecoder。forward_decoder 忽略 action_probs。
 
 核心修正:
 1. 修复计算图断裂 (Detach Bug): 真正启用 RSCGlobalChallenger，确保 Mask 操作保留 Backbone 梯度。
 2. 动作特征随机失活 (Action Dropout): 训练时 50% 概率阻断 Action 先验，彻底解决跨域时的级联失效。
-3. 路1: pose_decoder 换成 ActionPriorPoseDecoder。它额外需要 action_probs (动作软概率),
-   所有 forward_decoder 调用都透传 action_probs。
 
 NEW — Vision backbone option:
   If args.use_vision_backbone is True, the (csi_encoder + local_encoder +
@@ -24,10 +23,8 @@ import torch.nn.functional as F
 from .csi_encoder import DualBranchCSIEncoder
 from .local_encoder import LocalSpatioTemporalEncoder, LocalFeaturePooling
 from .global_encoder import GlobalTemporalModeler
-# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 留着不碍事
+# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 是 366 基线解码器
 from .pose_decoder import PoseDecoder, ActionClassifier
-# 路1: 动作×相位先验解码器
-from action_prior_root import ActionPriorPoseDecoder
 
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
@@ -97,12 +94,11 @@ class CSIRSCPoseDG(nn.Module):
         )
 
         # ------ 初始化 Decoder & Classifier ------
-        # 路1: 动作×相位先验解码器 (接口比原 PoseDecoder 多一个 action_probs 参数)
-        self.pose_decoder = ActionPriorPoseDecoder(
+        # 退回 366 基线: 用原 PoseDecoder (内部 coarse_head = TaskPromptCoarseHead)。
+        self.pose_decoder = PoseDecoder(
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,
-            num_actions=args.num_actions, residual_scale=0.3,
         )
         self.action_classifier = ActionClassifier(
             in_dim=args.global_dim,
@@ -126,15 +122,16 @@ class CSIRSCPoseDG(nn.Module):
         return z_local, z_global
 
     def forward_decoder(self, z_global, action_emb, action_probs=None):
-        # 路1: 透传 action_probs 给 ActionPriorPoseDecoder
-        return self.pose_decoder(z_global, action_emb, action_probs)
+        # 退回 366 基线: 旧 PoseDecoder 只吃 (z_global, action_emb), 忽略 action_probs。
+        # 保留 action_probs 参数签名, 这样 forward / forward_rsc 的调用点一行都不用改。
+        return self.pose_decoder(z_global, action_emb)
 
     def forward(self, csi, action_idx=None):
         """Standard forward pass (推理模式)."""
         z_local, z_global = self.forward_backbone(csi)
         action_logits = self.action_classifier(z_global)
 
-        # action_probs 两个分支都要有, 传给 ActionPriorPoseDecoder 做先验锚点
+        # action_probs 仍算出 (forward_rsc 等沿用), 但退回版 forward_decoder 会忽略它
         action_probs = F.softmax(action_logits, dim=-1)
 
         if action_idx is not None:

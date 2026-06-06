@@ -129,7 +129,10 @@ class PoseDecoder(nn.Module):
     def __init__(self, in_dim=256, hidden_dim=512, gcn_hidden=128,
                  num_gcn_layers=3, num_joints=17, action_embed_dim=32):
         super().__init__()
-        self.coarse_head = CoarsePoseHead(
+        # 退回 366 基线: distill_taskprompt 是用 TaskPromptCoarseHead 训的,
+        # 必须用它做 coarse_head 才能正确加载 (用 CoarsePoseHead 会 missing/unexpected)。
+        from taskprompt_decoder import TaskPromptCoarseHead
+        self.coarse_head = TaskPromptCoarseHead(
             in_dim, hidden_dim, num_joints, action_embed_dim
         )
         self.refiner = SkeletonRefiner(
