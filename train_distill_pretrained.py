@@ -220,11 +220,13 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         total = base_loss
         # === 路1: 动作×相位先验监督 + 残差幅度惩罚 ===
         _m = student.module if hasattr(student, 'module') else student
-        l_root, root_d = root_prior_losses(
-            _m.pose_decoder, outputs['p_final_clean'], pose_3d, action_labels,
-            lambda_res=args.lambda_res)
-        total = total + args.lambda_root_prior * l_root
-        meters['l_root_prior'].update(root_d['l_prior'], csi.shape[0])
+        # 366 基线的 PoseDecoder 无 root_head -> 自动跳过路1 先验; 仅 ActionPrior decoder 且权重>0 时启用
+        if args.lambda_root_prior > 0 and hasattr(_m.pose_decoder, 'root_head'):
+            l_root, root_d = root_prior_losses(
+                _m.pose_decoder, outputs['p_final_clean'], pose_3d, action_labels,
+                lambda_res=args.lambda_res)
+            total = total + args.lambda_root_prior * l_root
+            meters['l_root_prior'].update(root_d['l_prior'], csi.shape[0])
         # === 蒸馏项 (原有) ===
         if use_feat or use_out:
             teacher_out = teacher(depth)
@@ -241,7 +243,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         # === 结构正则: 骨长(对GT) + 左右对称 + 时序骨长稳定 (只动相对骨架, 不碰 root) ===
         l_struct, struct_d = structural_loss(
             outputs['p_final_clean'], pose_3d,
-            w_bone=args.w_bone, w_sym=args.w_sym, w_temp=args.w_temp)
+            w_bone=args.w_bone, w_sym=args.w_sym, w_temp=args.w_temp, w_rel=args.w_rel)
         total = total + l_struct
         meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
         (total / accum).backward()
@@ -260,6 +262,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
             msg = (f'Epoch [{epoch}] Batch [{i+1}/{len(loader)}] Loss: {meters["loss"].avg:.4f} '
                    f'Pose(C): {meters["l_pose_clean"].avg:.4f} Act: {meters["l_action"].avg:.4f}')
             msg += f' Struct: {meters["l_struct"].avg:.4f}'
+            msg += f" [bone={struct_d.get('bone',0):.3f} rel={struct_d.get('rel',0):.3f}]"
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
@@ -385,6 +388,7 @@ def get_args():
     p.add_argument('--w_bone', type=float, default=0.5)
     p.add_argument('--w_sym',  type=float, default=0.1)
     p.add_argument('--w_temp', type=float, default=0.1)
+    p.add_argument('--w_rel',  type=float, default=3.0)
 
     return p.parse_args()
 

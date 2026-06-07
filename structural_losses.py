@@ -66,7 +66,15 @@ def temporal_bone_loss(pred):
     return (bl[:, 1:] - bl[:, :-1]).abs().mean()
 
 
-def structural_loss(pred, gt=None, w_bone=0.5, w_sym=0.1, w_temp=0.1):
+def root_relative_loss(pred, gt):
+    """髋(joint0)中心化后的关节位置 L1。直接对齐相对骨架 = PA 量的那个量。
+    对 pred/gt 各自减自身 hip, 所以对全局 hip 平移不变, 碰不到定位主项。"""
+    pr = pred - pred[..., :1, :]
+    gr = gt - gt[..., :1, :]
+    return F.l1_loss(pr, gr)
+
+
+def structural_loss(pred, gt=None, w_bone=1.0, w_sym=0.1, w_temp=0.1, w_rel=3.0):
     """
     组合结构正则。
       pred : (B, T, J, 3) —— 用和 L_pose 同一个 (clean) 预测姿态。
@@ -77,8 +85,10 @@ def structural_loss(pred, gt=None, w_bone=0.5, w_sym=0.1, w_temp=0.1):
     total = pred.new_zeros(())
     if gt is not None:
         lb = bone_length_loss(pred, gt)
+        lr = root_relative_loss(pred, gt)
         comp['bone'] = float(lb.detach())
-        total = total + w_bone * lb
+        comp['rel'] = float(lr.detach())
+        total = total + w_bone * lb + w_rel * lr
     ls = symmetry_loss(pred)
     lt = temporal_bone_loss(pred)
     comp['sym'] = float(ls.detach())
