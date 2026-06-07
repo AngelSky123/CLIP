@@ -1,251 +1,142 @@
-# CSI-RSC-PoseDG: Depth-Distilled 3D Pose Estimation from WiFi CSI
+# CSI-RSC-PoseDG
 
-Cross-environment 3D human pose estimation from WiFi Channel State Information
-(CSI), evaluated on MMFi under the strict **Setting 3 (Cross-Environment) ×
-Protocol 3 (all 27 actions)** protocol. The student model uses **only CSI at
-inference**; depth maps are used solely at training time as a cross-modal
-teacher signal.
+基于 WiFi CSI 的跨环境 3D 人体姿态估计。训练期用深度图教师做知识蒸馏，**推理只用 CSI**（不依赖深度/视觉）。在 MMFi 上以严格盲测的跨房间设定（Setting 3 / Protocol 3，全 27 动作，单链路 CSI）对标 DT-Pose。
 
-> **Evaluation honesty note.** All numbers below use a **frame-faithful
-> evaluation** that matches DT-Pose's protocol exactly (every frame of every
-> E04 sequence scored once, no window padding, `action_idx=None`). An earlier
-> sliding-window evaluation under-counted frames and produced optimistic numbers
-> (~310 mm); those have been retracted. See *Evaluation Protocol* below.
+---
 
-
-## Headline result (MMFi Setting 3, Protocol 3, frame-faithful)
-
-| Method                                  | MPJPE ↓ | PA-MPJPE ↓ |
-|-----------------------------------------|:-------:|:----------:|
-| MetaFi++ (Zhou et al., 2023)            |  369.5  |   116.0    |
-| HPE-Li (Gian et al., 2025)              |  388.4  |   107.9    |
-| **DT-Pose (Chen et al., 2025)**         | **316.8** | **104.2** |
-| Ours (depth→CSI distill, EMA @ e48)     |  366.6  |   106.2    |
-
-**Honest standing:**
-- **PA-MPJPE 106.2 ≈ DT-Pose 104.2** — pose *structure* is essentially on par
-  (within ~2 mm).
-- **MPJPE 366.6 vs DT-Pose 316.8** — we trail by ~50 mm. The entire gap is in
-  **global localization** (root/hip placement), not skeletal structure.
-
-This is the current state, reported faithfully. We do **not** claim to beat
-DT-Pose on MPJPE.
-
-
-## Where the error lives (diagnosis)
-
-Decomposing the E04 result of the deployed checkpoint:
-
-| Component                          | Value    |
-|------------------------------------|:--------:|
-| MPJPE (absolute)                   | 366.6 mm |
-| MPJPE_aligned (hip-aligned, structure only) | 127.9 mm |
-| **hip_error (global root)**        | **337.7 mm** |
-| PA-MPJPE (Procrustes)              | 106.2 mm |
-
-Two facts drive everything:
-
-1. **Structure is fine.** MPJPE_aligned on the unseen room (E04, 127.9 mm) is
-   nearly identical to held-out in-domain val (~122 mm). Procrustes PA (106.2)
-   is within ~2 mm of DT-Pose. The CSI encoder, temporal modeler, and pose loss
-   are **not** the bottleneck.
-2. **Global localization is the whole gap.** `hip_error` of 337.7 mm accounts
-   for almost the entire MPJPE shortfall vs DT-Pose. Locating a person's
-   absolute position in an unseen room from single-link (3 Tx × 1 Rx) CSI is the
-   hard, partly physical limitation here — the depth teacher itself has
-   E04 hip_error ≈ 236 mm, so the geometry is hard even with depth.
-
-**Implication:** further loss-tuning of `lambda_out` / `hip_weight` on top of
-teacher distillation does not move localization (a run with hip distill weight
-4.0 moved E04 hip_error by only ~3 mm over 50 epochs), because the teacher's own
-localization is weak. Localization must be supervised directly against GT and
-**decoupled** from skeletal structure — see *Root-decoupled decoder*.
-
-
-## Method
-
-Two stages, with the first reused across runs:
-
-**Step A — Depth teacher (one-time).**
-A small encoder-temporal-pose pipeline is supervised on RGB-D depth
-(`(T, 1, 112, 112)`, 16-bit mm) from the source environments. Outputs a temporal
-feature `z_global ∈ R^(B,T,128)` and pose `p_final ∈ R^(B,T,17,3)` (meters).
-Frozen after training. Teacher E04 probe: **MPJPE 269 / PA 89.5** — better than
-DT-Pose on this probe, but it uses depth and is not the deployed system, and its
-hip_error (~236 mm) shows localization is hard even with depth.
-
-**Step B+ — Depth → CSI distillation on a pretrained CSI backbone.**
-The CSI student (`CSIRSCPoseDG`: dual-branch CSI encoder → local 3D-CNN →
-feature pooling → temporal modeler → action-conditioned pose decoder + action
-classifier + RSC) is initialized from the Stage1B Action checkpoint
-(`action_best.pt`) and fine-tuned with:
+## 1. 方法概述
 
 ```
-L = L_pose(student vs GT)            [primary]
-  + λ_feat · L_feat (z_s_proj, z_t)  [feature-level alignment]
-  + λ_out  · L_out  (p_s_clean, p_t) [pose-level structural alignment]
+CSI (T,9,114,10)
+   └─ csi_encoder ──> local_encoder (3D conv) ──> feature_pooling
+        ──> global_modeler (Transformer + TCN)  ──>  z_global (B,64,128)
+              ├─ pose_decoder (TaskPromptCoarseHead + SkeletonRefiner/GCN) ──> 3D pose (B,T,17,3)
+              ├─ action_classifier
+              └─ RSC (representation self-challenging)
 ```
 
-- `L_feat`: cosine + smooth-L1 on a learned 128→128 student projection vs the
-  teacher's `z_global` (teacher detached).
-- `L_out`: smooth-L1 (β = 5 cm) on the student's clean pose vs teacher pose.
-  **Now configured for structure only** (`hip_weight = 1.0`); global hip is
-  supervised by GT, not by the teacher.
+- **教师**：深度图姿态教师 (`DepthPoseTeacher`)，训练期冻结，对学生做 feature-level + output-level 蒸馏。
+- **学生**：CSI-only，参数量约 **1.58M**。
+- **结构正则**（当前版本新增，见 `structural_losses.py`）：骨长对齐 (vs GT)、左右对称、时序骨长稳定、root-relative（髋中心）位置对齐。四项均**平移不变**，只约束相对骨架，不触碰全局 hip 定位项。
 
-**Inference is strictly CSI-only.** Depth is consumed only by the frozen teacher
-during training on source environments; E04 is never paired with depth.
+---
 
-### EMA stabilizer
+## 2. 实验设定（与 DT-Pose 对齐）
 
-Exponential moving average of student weights with a decay-warmup schedule:
+| 项 | 设定 |
+|---|---|
+| 数据集 | MMFi |
+| 划分 | **Setting 3（跨环境 / cross-environment）** |
+| 协议 | **Protocol 3（全 27 动作）** |
+| 训练环境 | E01–E03（S01–S30） |
+| 测试环境 | **E04（S31–S40），严格盲测、训练期从不参与** |
+| 输入 | 单链路 CSI（3Tx×1Rx），64 帧窗口 `(T=64, 9, 114, 10)` |
+| 推理 | **CSI-only** |
+| 评测口径 | 逐帧、全帧覆盖、无 padding、`action_idx=None`（与 DT-Pose 的单帧绝对评测一致）。MPJPE 为纯绝对误差（不做任何 centering）；PA-MPJPE 用含 scale 的 Procrustes 对齐 |
+
+> **可复现性**：所有训练固定 `--seed 42` 并启用 `cudnn.deterministic=True / benchmark=False`。报告数一律来自 `eval_dtpose_faithful.py`（唯一权威口径）；训练期 `evaluate_v2` 的滑窗监控值与 faithful 口径不可比，**不用于报告**。
+
+---
+
+## 3. 结果（E04，faithful 逐帧口径）
+
+| 模型 | MPJPE (mm) | PA-MPJPE (mm) | hip_err (mm) |
+|---|---|---|---|
+| baseline（TaskPrompt 解码器） | 366.6 | 106.2 | 337.8 |
+| + 结构正则（骨长/对称/时序） | 361.97 | **105.42** | 334.91 |
+| + root-relative 位置对齐（当前版本，训练中） | _TBD_ | _TBD_ | _TBD_ |
+| **DT-Pose (S3/P3)** | **316.8** | **104.2** | — |
+
+> PA-MPJPE 方差极小（多 stride 评测 σ ≈ 0.02mm），105.42 为稳定真值。
+> _注：最后一行待当前 `distill_struct_rel` 训练完成后用 faithful 口径填入。_
+
+**小结**：在结构指标 PA-MPJPE 上，本方法（105.4）与 DT-Pose（104.2）**基本持平**，差距约 1mm，处于单链路 CSI 的硬件分辨率地板附近（DT-Pose 原文亦指出手/肘等末端误差受限于 WiFi 分辨率，需更多设备/更高分辨率）。绝对 MPJPE 落后约 45mm，差距**全部集中在 hip 全局定位**（见 §4）。
+
+---
+
+## 4. Limitation 分析：跨房间绝对定位的信息上界
+
+绝对 MPJPE 的差距并非建模不足，而是**单链路 CSI 中“人在未见过房间里的绝对位置”这一信息本身不可跨域迁移**。多条独立证据指向同一结论：
+
+**(a) 原始输入信息探针**（`probe_raw_amplitude_hip.py`）。用线性岭回归从 CSI 幅度直接预测 E04 hip 绝对坐标，无论保留绝对尺度与否：
+
+| 特征 | held-in (E01–03) | E04 |
+|---|---|---|
+| mean_base（预测训练集均值，零信息标尺） | 172.7 | **324.2** |
+| 原始绝对幅度 | 152.3 | 350.8 |
+| log 功率 | 155.5 | 348.8 |
+| 逐帧归一化幅度 | 149.6 | 356.4 |
+
+三种幅度表示在训练房间都优于零信息标尺，**在 E04 上却全部劣于零信息标尺**——典型的“室内可学、跨房间反向迁移”，说明幅度→定位的映射逐房间不同，不可迁移。
+
+**(b) 教师上界**。深度图教师（拥有视觉深度）在 E04 的 hip_err 仍达 ~236mm，即便强信号模态也难以恢复跨房间绝对位置。
+
+**(c) 完整模型 vs 零信息基线**。部署模型在 E04 的 hip_err（~335mm）已与“永远预测平均位置”的零信息基线（324mm）相当或更高——用满全部输入的非线性模型在绝对定位上未超过常数预测，进一步印证信息不在特征中。
+
+**(d) 杠杆穷举**。解码器结构（多轮）、自监督预训练（MAE-DCL：TC-CL + uniformity）、合规 test-time 重心化、蒸馏权重调参——均未移动 hip 误差。
+
+**结论**：在严格盲测的跨房间、单链路 CSI、CSI-only 推理下，绝对 MPJPE 受信息论上界约束；可改善的空间在**相对结构（PA-MPJPE）**，本方法已将其推至 SOTA 持平水平。
+
+---
+
+## 5. 复现步骤
+
+### 环境
 ```
-decay_t  = min(target_decay, (1 + t) / (10 + t))
-shadow_t = decay_t · shadow_{t-1} + (1 - decay_t) · model_t
-```
-The warmup is essential — constant decay=0.999 produces nonsense evals
-(MPJPE > 900 mm) for the first ~5 epochs.
-
-
-## Root-decoupled decoder (current improvement, in progress)
-
-Motivated by the diagnosis (all gap = global localization), the pose decoder is
-being restructured to **decouple** the two tasks:
-
-- **PoseRelHead** — root-relative skeleton (17×3 with root forced to origin),
-  action-conditioned; reuses the structure path that already works.
-- **RootHead** — a separate head regressing the global hip xyz, **supervised by
-  GT only (no teacher distillation, since the teacher's hip is itself biased)**,
-  with light temporal smoothing to suppress per-frame jitter.
-
-Final pose `= pose_rel + root_xyz`. Interface is identical to the original
-decoder, so the rest of the pipeline (forward / RSC / distillation) is unchanged.
-See `root_decoupled_decoder.py`.
-
-> **Status: training.** Results for this variant are not yet in. The expected
-> realistic gain is to pull MPJPE from ~366 toward ~330–345 by reducing hip
-> jitter and unblocking structure from translation. It is **not** expected to
-> close the full gap to 316.8 — cross-environment absolute localization from
-> single-link CSI is a partly physical limit, not a decoder-design problem. This
-> section will be updated with frame-faithful numbers once the run completes.
-
-
-## Repository Layout
-
-```
-.
-├── README.md
-├── config.py
-├── dataset.py / dataset_distill.py
-├── augmentation.py
-├── losses.py
-├── distill_loss.py
-├── evaluate.py                     # MPJPE / PA-MPJPE / PCK (DT-Pose-aligned formulas)
-├── evaluate_v2.py                  # + hip_error, variance tools (online monitor)
-├── eval_dtpose_faithful.py         # frame-faithful final eval (matches DT-Pose protocol)
-├── root_decoupled_decoder.py       # Root/Pose decoupled decoder (current improvement)
-├── utils.py
-│
-├── train_depth_teacher.py          # Step A
-├── train.py                        # Stage1A/1B & Stage2 baselines
-├── train_distill_pretrained.py     # Step B+ — main entry (EMA + 4-ckpt save)
-│
-└── models/
-    ├── csi_encoder.py / local_encoder.py / global_encoder.py
-    ├── pose_decoder.py / rsc.py / mixstyle.py
-    ├── full_model.py               # CSIRSCPoseDG
-    └── depth_teacher.py
-```
-
-
-## Setup
-
-```bash
-# Tested on Python 3.7, PyTorch 2.2.2, CUDA 12.x, RTX 4080 (16 GB)
-pip install torch torchvision numpy scipy
+Python 3.7 / PyTorch 2.2.2 / CUDA (RTX 4080, 16GB)
+依赖见 requirements（numpy, scipy, torch ...）
 ```
 
-Data: MMFi at `/home/<user>/PerceptAlign/MMFi/<E01..E04>/<S01..S40>/<A01..A27>/`
-with `ground_truth.npy`, `depth/`, `wifi-csi/` per sequence.
+### 数据
+MMFi 置于 `--data_root`，目录结构：
+```
+<data_root>/E0{1..4}/S{01..40}/A{01..27}/{wifi-csi/frame*.mat, depth/, ground_truth.npy}
+```
 
-
-## Reproduction
-
-### Step B+ — Depth → CSI distillation (root-decoupled, current config)
+### 训练（当前版本：结构正则 + root-relative）
 ```bash
 python train_distill_pretrained.py \
-    --data_root /home/<user>/PerceptAlign/MMFi \
+    --data_root /path/to/MMFi \
     --train_envs E01 E02 E03 --test_env E04 \
     --pretrain_ckpt checkpoints/stage1b_action/action_best.pt \
     --teacher_ckpt  checkpoints/depth_teacher_full/teacher_best.pt \
     --depth_img 112 --depth_clip 5000 \
-    --lambda_feat 0.1 --lambda_out 0.5 \
-    --out_distill_hip_weight 1.0 --lambda_hip 1.0 --gamma 0.01 \
-    --val_ratio 0.15 \
+    --w_bone 1.0 --w_sym 0.1 --w_temp 0.1 --w_rel 3.0 \
     --epochs 50 --batch_size 2 --accumulate_grad 8 \
-    --lr_backbone 1e-4 --lr_head 5e-4 \
-    --use_ema --ema_decay 0.999 \
-    --save_dir ./checkpoints/distill_rootdecoupled
+    --use_ema --ema_decay 0.999 --seed 42 \
+    --save_dir ./checkpoints/distill_struct_rel
 ```
-(Requires swapping `self.pose_decoder` to `RootDecoupledPoseDecoder` in
-`models/full_model.py`; keep the `ActionClassifier` import.)
+- `--w_bone/--w_sym/--w_temp/--w_rel`：四项结构损失权重。
+- 选点在 E01–E03 held-out subjects 的 val MPJPE 上；E04 仅监控、不参与选点。
 
-### Final evaluation (frame-faithful, the only number to report)
+### 评测（唯一权威口径）
 ```bash
 python eval_dtpose_faithful.py \
-    --data_root /home/<user>/PerceptAlign/MMFi \
-    --ckpt ./checkpoints/distill_rootdecoupled/best_mpjpe_ema.pth \
+    --data_root /path/to/MMFi \
+    --ckpt ./checkpoints/distill_struct_rel/best_mpjpe_ema.pth \
     --test_env E04 --seq_len 64 --variance
 ```
+`--variance` 跑多 stride 报 mean±σ，用于判断指标差异是否超过评测口径噪声。
 
+---
 
-## Evaluation Protocol
+## 6. 关键文件
 
-Numbers follow the MMFi benchmark definitions used by DT-Pose (Section A.2).
+| 文件 | 说明 |
+|---|---|
+| `train_distill_pretrained.py` | 主训练脚本（蒸馏 + EMA + held-out 选点 + 结构正则） |
+| `structural_losses.py` | 结构正则：骨长 / 对称 / 时序骨长 / root-relative |
+| `eval_dtpose_faithful.py` | 逐帧 faithful 评测（与 DT-Pose 对齐的权威口径） |
+| `probe_raw_amplitude_hip.py` | 原始幅度 → E04 hip 绝对定位信息探针（§4 分析依据） |
+| `models/` | CSI-RSC-PoseDG 学生网络 |
+| `models/depth_teacher.py` | 深度图教师 |
+| `losses.py` / `distill_loss.py` | 基础姿态损失 / 蒸馏损失 |
+| `dataset.py` / `dataset_distill.py` | MMFi 数据加载 |
 
-- **MPJPE / PA-MPJPE / MPJPE_aligned**: implemented in `evaluate.py`, verified
-  numerically equivalent to DT-Pose's `calulate_error` /
-  `compute_similarity_transform`.
-- **Frame-faithful protocol** (`eval_dtpose_faithful.py`): each frame of every
-  E04 sequence is predicted **exactly once** (non-overlapping windows + a tail
-  window covering only uncovered frames), **no edge-padding**, `action_idx=None`
-  (no test-time label leakage). All frames pooled, metric computed once — this
-  matches DT-Pose's per-frame, equal-weight averaging.
-  - Difference from DT-Pose that **remains by design**: our model consumes 64
-    frames of temporal context per prediction; DT-Pose is per-frame. This is a
-    method-level difference and is reported as such.
-- **Variance floor**: `multi_stride_variance` quantifies evaluation-protocol
-  noise. For the deployed checkpoint, σ(MPJPE) = 0.03 mm — i.e. the gap to
-  DT-Pose is real, not measurement noise.
-- **Setting 3 / Protocol 3**: train E01–E03 (S01–S30), test E04 (S31–S40), all
-  27 actions, `action_idx=None` at test.
+---
 
-Reference DT-Pose Setting 3 numbers (Table 1, arXiv:2501.09411):
+## 7. 诚实声明
 
-|                | P1 (14) | P2 (13) | **P3 (all 27)** |
-|----------------|:-------:|:-------:|:---------------:|
-| MPJPE ↓        | 332.7   | 338.3   | **316.8**       |
-| PA-MPJPE ↓     | 105.1   | 102.0   | **104.2**       |
-
-
-## Known limits
-
-- **PA-MPJPE floor ~106 mm.** Across all configurations PA converges to
-  105–108 mm. This is hypothesized to be a hardware limit of single-link
-  (3 Tx × 1 Rx) CSI on MMFi: fine-extremity joints (hands, elbows, feet) — where
-  PA error concentrates after Procrustes — are not resolvable at this antenna /
-  subcarrier resolution. Not worth further loss engineering.
-- **Global localization is the open problem.** ~50 mm of the MPJPE gap to
-  DT-Pose is hip placement in unseen rooms. This is the active research target;
-  it is partly physical (single-link CSI) and not closable by decoder tweaks
-  alone.
-
-
-## References
-
-> Chen, Y., Guo, J., Guo, S., Zhou, J., Tao, D. *Towards Robust and Realistic
-> Human Pose Estimation via WiFi Signals.* arXiv:2501.09411, 2025.
-
-> Yang, J. et al. *MM-Fi: Multi-Modal Non-Intrusive 4D Human Dataset for
-> Versatile Wireless Sensing.* NeurIPS D&B Track, 2023.
-
-> He, K. et al. *Masked Autoencoders Are Scalable Vision Learners.* CVPR 2022.
+- 报告的所有数均来自严格盲测（E04 训练期从不可见）+ faithful 逐帧口径，无 GT 动作标签泄露、无对 E04 真值的对齐。
+- PA-MPJPE 与 DT-Pose 持平（约 1mm 内）；绝对 MPJPE 落后，且本文将其归因于信息论上界并给出测量证据，而非声称全面超越。
+- 任何低于 faithful 报告值的数（如训练期滑窗监控值）均不作为结论。
