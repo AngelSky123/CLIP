@@ -198,7 +198,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_cons', 'l_action',
                'l_distill_feat', 'l_distill_out', 'l_distill_out_mm', 'l_root_prior',
-               'l_struct']}
+               'l_struct', 'l_anchor']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
@@ -246,6 +246,12 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
             w_bone=args.w_bone, w_sym=args.w_sym, w_temp=args.w_temp, w_rel=args.w_rel)
         total = total + l_struct
         meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
+        # === root anchor: 把预测 hip 往按动作源域 canonical 拉 (诚实救 MPJPE, 不碰 E04) ===
+        if getattr(args, '_canonical', None) is not None and args.w_root_anchor > 0:
+            from structural_losses import root_anchor_loss
+            l_anchor = root_anchor_loss(outputs['p_final_clean'], action_labels, args._canonical)
+            total = total + args.w_root_anchor * l_anchor
+            meters['l_anchor'].update(float(l_anchor.detach()), csi.shape[0])
         (total / accum).backward()
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
             if args.grad_clip > 0:
@@ -263,6 +269,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                    f'Pose(C): {meters["l_pose_clean"].avg:.4f} Act: {meters["l_action"].avg:.4f}')
             msg += f' Struct: {meters["l_struct"].avg:.4f}'
             msg += f" [bone={struct_d.get('bone',0):.3f} rel={struct_d.get('rel',0):.3f}]"
+            if args.w_root_anchor > 0:
+                msg += f' Anchor: {meters["l_anchor"].avg:.4f}'
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
@@ -389,6 +397,9 @@ def get_args():
     p.add_argument('--w_sym',  type=float, default=0.1)
     p.add_argument('--w_temp', type=float, default=0.1)
     p.add_argument('--w_rel',  type=float, default=3.0)
+    p.add_argument('--w_root_anchor', type=float, default=0.0)   # >0 启用 root anchor (救 MPJPE)
+    p.add_argument('--fk_alpha_final', type=float, default=0.4)  # Hybrid FK 融合系数终值
+    p.add_argument('--fk_alpha_warmup', type=int, default=20)    # alpha 1.0->final 的退火 epoch 数
 
     return p.parse_args()
 
@@ -454,9 +465,21 @@ def main():
             'mpjpe_ema': float('inf'), 'pa_ema': float('inf')}
     patience = 0
 
+    # root anchor: 预扫训练集 GT 构建按动作 canonical hip (只读 .npy, 快; 不碰 E04)
+    args._canonical = None
+    if args.w_root_anchor > 0:
+        from structural_losses import build_action_canonical
+        args._canonical = build_action_canonical(args.data_root, args.train_envs).to(device)
+        logger.info(f'[root_anchor] canonical hip 表已构建 ({args._canonical.shape[0]} actions), w={args.w_root_anchor}')
+
     for epoch in range(1, args.epochs + 1):
         lrs = [g['lr'] for g in optimizer.param_groups]
         logger.info(f'\n{"="*60}\nEpoch {epoch}/{args.epochs} | LR bb={lrs[0]:.2e} hd={lrs[1]:.2e}')
+        _md = student.module if hasattr(student, 'module') else student
+        if hasattr(_md.pose_decoder, 'set_alpha'):
+            _a = max(args.fk_alpha_final, 1.0 - (1.0 - args.fk_alpha_final) * (epoch - 1) / max(1, args.fk_alpha_warmup))
+            _md.pose_decoder.set_alpha(_a)
+            logger.info(f'[FK] epoch {epoch} alpha={_a:.3f}')
         tm = train_one_epoch(student, proj, teacher, train_loader, optimizer,
                              total_loss_fn, pose_loss_fn, feat_distill_fn, out_distill_fn,
                              device, epoch, logger, args, ema=ema)

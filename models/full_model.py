@@ -29,6 +29,7 @@ from .pose_decoder import PoseDecoder, ActionClassifier
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
 
+from fk_decoder import HybridFKPoseDecoder
 
 class CSIRSCPoseDG(nn.Module):
     def __init__(self, args):
@@ -95,7 +96,12 @@ class CSIRSCPoseDG(nn.Module):
 
         # ------ 初始化 Decoder & Classifier ------
         # 退回 366 基线: 用原 PoseDecoder (内部 coarse_head = TaskPromptCoarseHead)。
-        self.pose_decoder = PoseDecoder(
+        # self.pose_decoder = PoseDecoder(
+        #     in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
+        #     gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
+        #     num_joints=args.num_joints, action_embed_dim=action_embed_dim,
+        # )
+        self.pose_decoder = HybridFKPoseDecoder(
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,

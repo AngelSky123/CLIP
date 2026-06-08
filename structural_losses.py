@@ -134,3 +134,52 @@ if __name__ == "__main__":
     print("[no gt] total=%.4f  comp=%s (无 bone 项)" % (float(tot3.detach()), comp3))
     assert 'bone' not in comp3
     print("\n[ALL OK]")
+
+
+# ======================================================================
+# Root anchor (诚实救 MPJPE): 把预测 hip 往【按动作的源域 canonical 位置】拉。
+# 动机: 实测模型 E04 hip_err(335) > 预测均值的零信息基线(324), 说明学出的 root
+#       比常数还差 (源域过拟合+漂移)。往稳健的源域先验拉 = 不靠偷看 E04、不对齐真值,
+#       只是"别让 root 比常数更烂", 可诚实回收 ~10mm MPJPE。不追 316.8 (信息上界)。
+# ======================================================================
+import os as _os
+import glob as _glob
+import numpy as _np
+
+_ENV_SUBJECTS = {'E01': range(1, 11), 'E02': range(11, 21),
+                 'E03': range(21, 31), 'E04': range(31, 41)}
+
+
+def build_action_canonical(data_root, train_envs, num_actions=27, hip_joint=0):
+    """扫训练集 GT (只读 ground_truth.npy, 不碰 CSI, 很快), 算每个动作的源域平均 hip。
+    返回 (num_actions, 3) 的 float tensor; 缺失动作回退为全局平均 hip。
+    """
+    sums = _np.zeros((num_actions, 3), dtype=_np.float64)
+    cnts = _np.zeros((num_actions,), dtype=_np.int64)
+    for env in train_envs:
+        for sid in _ENV_SUBJECTS[env]:
+            subj = f'S{sid:02d}'
+            for aid in range(1, num_actions + 1):
+                gt_path = _os.path.join(data_root, env, subj, f'A{aid:02d}', 'ground_truth.npy')
+                if not _os.path.exists(gt_path):
+                    continue
+                gt = _np.load(gt_path).astype(_np.float64)   # (F,17,3)
+                sums[aid - 1] += gt[:, hip_joint, :].sum(axis=0)
+                cnts[aid - 1] += gt.shape[0]
+    glob_mean = sums.sum(0) / max(cnts.sum(), 1)
+    canon = _np.zeros((num_actions, 3), dtype=_np.float32)
+    for a in range(num_actions):
+        canon[a] = (sums[a] / cnts[a]) if cnts[a] > 0 else glob_mean
+    return torch.from_numpy(canon)
+
+
+def root_anchor_loss(pred, action_labels, canonical):
+    """把 pred 的 hip(joint0) 往按动作源域 canonical 位置拉 (Smooth-L1)。
+      pred          : (B,T,J,3)
+      action_labels : (B,) long, 取值 0..num_actions-1
+      canonical     : (num_actions,3) tensor (与 pred 同 device)
+    """
+    pred_hip = pred[:, :, 0, :]                         # (B,T,3)
+    target = canonical.to(pred.device)[action_labels]  # (B,3)
+    target = target[:, None, :].expand_as(pred_hip)    # (B,T,3)
+    return F.smooth_l1_loss(pred_hip, target, beta=0.05)
