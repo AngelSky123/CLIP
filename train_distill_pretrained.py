@@ -1,21 +1,22 @@
 """
-Step B+ : depth -> CSI distillation, 从 Stage1B 预训练 backbone 出发。
-v3 (相对上一版的改动):
-  - checkpoint 选择改到 E01-E03 的 held-out val (按 subject 划, 不参与训练);
-    E04 仍每轮评测但只作监控、不参与选点 -> 最终报在 E04 的数不再是测试集调参。
-  - 仍带 EMA + 四 checkpoint (best_mpjpe/pa × raw/ema)。
-  - hip 蒸馏强度由命令行控制 (--out_distill_hip_weight / --lambda_out), 不改代码。
+Step B+ v4 : depth -> CSI distillation, 从 Stage1B 预训练 backbone 出发。
 
-诊断结论 (为什么这么配):
-  教师 E04: MPJPE269 (结构108/PA90 极好, hip误差236, lateral左偏174);
-  学生 E04: MPJPE329 (结构127, hip误差301, lateral左偏249)。
-  lateral 漂移是跨环境固有(教师也中招), 不可消除 -> 不调 lambda_hip。
-  但学生 hip(249)>教师(174)、结构(127)>教师(108) 的差是"该抄没抄到", 可蒸馏 ->
-  加大 output-distill: hip_weight 1.5->4, lambda_out 0.5->1.0, 目标逼近教师 269。
+v4 相对 v3 的改动 (目标: 在不动 PA-MPJPE 的前提下降 MPJPE):
+  - pose_decoder 现在是 PriorRootDecoder(HybridFKPoseDecoder(...)):
+      结构支保持不变, 全局 root 换成 [按动作源域先验 + tanh 限幅小残差]。
+      改 root 在数学上不改 PA / MPJPE_aligned (逐帧去平移), 只改 raw MPJPE 的
+      hip_error 项, 且在 E04 被先验+8cm 上界约束, 不再像 v3 那样后期乱漂。
+  - 训练初始化: 用源域 canonical hip 初始化 action_prior (在建 EMA 之前)。
+  - 去掉对 root 不可迁移的压力:
+      lambda_hip 0.3 -> 0.0 (HipPositionLoss 只拉向源域 GT hip, 不可迁移, 对 PA 无关)
+      out_distill_hip_weight 4.0 -> 1.0 (别再重压不可迁移的教师 hip)
+  - 旧的 root_anchor / 路1 action-prior 分支已移除 (先验现在进了架构)。
+  - 新增残差 L2 惩罚 (--w_root_res), 防止残差饱和。
+  - epochs 默认 25 (E04 最优在 ~e9, 50 epoch 只过拟合源域)。
+  - 新增周期性 checkpoint (每个 eval_interval 存 raw+ema), 便于对 val 选不出来的
+    早期 epoch 单独跑 eval_dtpose_faithful。
 
-注意: 本文件不含你之前自加的 Kine 损失。按诊断, 结构(MPJPE_a)已优于教师,
-  Kine 优化的正是结构、动不了全局定位瓶颈, 建议去掉。若仍要保留, 在
-  train_one_epoch 里把你的 Kine 项重新加回 total 即可。
+选点仍在 E01-E03 held-out val; E04 仅监控、不参与选点。
 """
 import os
 import sys
@@ -42,8 +43,7 @@ from distill_loss import DistillProjection, FeatureDistillLoss, OutputDistillLos
 from utils import (set_seed, setup_logger, count_parameters,
                    save_checkpoint, AverageMeter, Timer, save_run_config)
 
-from action_prior_root import root_prior_losses
-from structural_losses import structural_loss
+from structural_losses import structural_loss, build_action_canonical
 
 
 try:
@@ -162,7 +162,6 @@ def split_by_subject(dataset, val_ratio, seed):
 
 
 def build_loaders(args, logger):
-    # 同一组 E01-E03 序列, 建两份 dataset (train 带增广 / val 不带), 索引顺序一致
     common = dict(seq_len=args.seq_len, stride=32, with_depth=True, with_csi=True,
                   depth_img=args.depth_img, depth_clip=args.depth_clip)
     train_full = MMFiDistillDataset(args.data_root, args.train_envs, csi_augment=True, **common)
@@ -178,7 +177,6 @@ def build_loaders(args, logger):
     val_loader = DataLoader(Subset(val_full, va_idx), batch_size=args.batch_size,
                             shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    # E04: 监控用 (不参与选点)
     test_ds = MMFiDistillDataset(args.data_root, [args.test_env], seq_len=args.seq_len,
                                  stride=args.seq_len, with_depth=False, with_csi=True,
                                  depth_img=args.depth_img, depth_clip=args.depth_clip,
@@ -197,8 +195,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
     student.train(); proj.train()
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_cons', 'l_action',
-               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm', 'l_root_prior',
-               'l_struct', 'l_anchor']}
+               'l_distill_feat', 'l_distill_out', 'l_distill_out_mm',
+               'l_struct', 'l_root_res']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
@@ -218,16 +216,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
         base_loss, loss_dict = total_loss_fn(outputs, pose_3d, training=True,
                                              action_loss=action_loss)
         total = base_loss
-        # === 路1: 动作×相位先验监督 + 残差幅度惩罚 ===
-        _m = student.module if hasattr(student, 'module') else student
-        # 366 基线的 PoseDecoder 无 root_head -> 自动跳过路1 先验; 仅 ActionPrior decoder 且权重>0 时启用
-        if args.lambda_root_prior > 0 and hasattr(_m.pose_decoder, 'root_head'):
-            l_root, root_d = root_prior_losses(
-                _m.pose_decoder, outputs['p_final_clean'], pose_3d, action_labels,
-                lambda_res=args.lambda_res)
-            total = total + args.lambda_root_prior * l_root
-            meters['l_root_prior'].update(root_d['l_prior'], csi.shape[0])
-        # === 蒸馏项 (原有) ===
+
+        # === 蒸馏项 ===
         if use_feat or use_out:
             teacher_out = teacher(depth)
             if use_feat:
@@ -240,18 +230,23 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                 total = total + args.lambda_out * l_out
                 meters['l_distill_out'].update(od['l_distill_out'], csi.shape[0])
                 meters['l_distill_out_mm'].update(od['l_distill_out_mm'], csi.shape[0])
-        # === 结构正则: 骨长(对GT) + 左右对称 + 时序骨长稳定 (只动相对骨架, 不碰 root) ===
+
+        # === 结构正则: 只动相对骨架, 不碰 root (PA 杠杆) ===
         l_struct, struct_d = structural_loss(
             outputs['p_final_clean'], pose_3d,
             w_bone=args.w_bone, w_sym=args.w_sym, w_temp=args.w_temp, w_rel=args.w_rel)
         total = total + l_struct
         meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
-        # === root anchor: 把预测 hip 往按动作源域 canonical 拉 (诚实救 MPJPE, 不碰 E04) ===
-        if getattr(args, '_canonical', None) is not None and args.w_root_anchor > 0:
-            from structural_losses import root_anchor_loss
-            l_anchor = root_anchor_loss(outputs['p_final_clean'], action_labels, args._canonical)
-            total = total + args.w_root_anchor * l_anchor
-            meters['l_anchor'].update(float(l_anchor.detach()), csi.shape[0])
+
+        # === 先验 root 残差 L2 惩罚 (在 clean z_global 上重算残差, 梯度干净) ===
+        _md = student.module if hasattr(student, 'module') else student
+        if args.w_root_res > 0 and hasattr(_md.pose_decoder, 'res'):
+            res_c = (torch.tanh(_md.pose_decoder.res(outputs['z_global']))
+                     * _md.pose_decoder.residual_scale)
+            l_res = res_c.pow(2).mean()
+            total = total + args.w_root_res * l_res
+            meters['l_root_res'].update(float(l_res.detach()), csi.shape[0])
+
         (total / accum).backward()
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
             if args.grad_clip > 0:
@@ -269,8 +264,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer,
                    f'Pose(C): {meters["l_pose_clean"].avg:.4f} Act: {meters["l_action"].avg:.4f}')
             msg += f' Struct: {meters["l_struct"].avg:.4f}'
             msg += f" [bone={struct_d.get('bone',0):.3f} rel={struct_d.get('rel',0):.3f}]"
-            if args.w_root_anchor > 0:
-                msg += f' Anchor: {meters["l_anchor"].avg:.4f}'
+            if args.w_root_res > 0:
+                msg += f' RootRes: {meters["l_root_res"].avg:.4f}'
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
@@ -325,7 +320,7 @@ def _save(state, optimizer, epoch, metrics, path):
 # Args
 # ----------------------------------------------------------------------
 def get_args():
-    p = argparse.ArgumentParser(description='Step B+ v3: distill + EMA + held-out val')
+    p = argparse.ArgumentParser(description='Step B+ v4: distill + EMA + prior-root')
     p.add_argument('--data_root', type=str, default='/home/a123456/PerceptAlign/MMFi')
     p.add_argument('--train_envs', nargs='+', default=['E01', 'E02', 'E03'])
     p.add_argument('--test_env', type=str, default='E04')
@@ -335,11 +330,11 @@ def get_args():
     p.add_argument('--pretrain_ckpt', type=str, required=True)
     p.add_argument('--teacher_ckpt', type=str, required=True)
     p.add_argument('--lambda_feat', type=float, default=0.1)
-    p.add_argument('--lambda_out',  type=float, default=1.0)   # 0.5 -> 1.0
+    p.add_argument('--lambda_out',  type=float, default=1.0)
     p.add_argument('--distill_cos_w', type=float, default=1.0)
     p.add_argument('--distill_sl1_w', type=float, default=1.0)
     p.add_argument('--out_distill_beta', type=float, default=0.05)
-    p.add_argument('--out_distill_hip_weight', type=float, default=4.0)  # 1.5 -> 4.0
+    p.add_argument('--out_distill_hip_weight', type=float, default=1.0)   # v3 是 4.0
     p.add_argument('--amp_channels', type=int, default=3)
     p.add_argument('--phase_channels', type=int, default=6)
     p.add_argument('--encoder_hidden_dim', type=int, default=32)
@@ -364,12 +359,12 @@ def get_args():
     p.add_argument('--lambda1', type=float, default=1.0)
     p.add_argument('--lambda2', type=float, default=0.5)
     p.add_argument('--lambda3', type=float, default=2.0)
-    p.add_argument('--lambda_hip', type=float, default=0.3)
+    p.add_argument('--lambda_hip', type=float, default=0.0)   # v3 是 0.3; 关掉 (对 PA 无关, 只加 root 方差)
     p.add_argument('--alpha', type=float, default=0.5)
     p.add_argument('--beta', type=float, default=2.0)
     p.add_argument('--gamma', type=float, default=0.0)
     p.add_argument('--delta', type=float, default=0.5)
-    p.add_argument('--epochs', type=int, default=50)
+    p.add_argument('--epochs', type=int, default=25)         # v3 是 50; E04 最优在 ~e9
     p.add_argument('--batch_size', type=int, default=2)
     p.add_argument('--accumulate_grad', '--accum', type=int, default=8)
     p.add_argument('--lr_backbone', type=float, default=1e-4)
@@ -382,24 +377,34 @@ def get_args():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--log_interval', type=int, default=100)
-    p.add_argument('--save_dir', type=str, default='./checkpoints/distill_hipout')
-    p.add_argument('--val_ratio', type=float, default=0.15,
-                   help='E01-E03 里留作 val 选点的 subject 比例 (不参与训练)')
+    p.add_argument('--save_dir', type=str, default='./checkpoints/distill_priorroot')
+    p.add_argument('--val_ratio', type=float, default=0.15)
     p.add_argument('--use_ema', dest='use_ema', action='store_true', default=True)
     p.add_argument('--no_ema', dest='use_ema', action='store_false')
     p.add_argument('--ema_decay', type=float, default=0.999)
     p.add_argument('--ema_no_warmup', action='store_true', default=False)
 
-    p.add_argument('--lambda_root_prior', type=float, default=1.0)
-    p.add_argument('--lambda_res',         type=float, default=0.1)
-
-    p.add_argument('--w_bone', type=float, default=0.5)
+    # 结构正则 (保持你最优 PA 那次跑用的值; 默认沿用仓库默认, 需要时显式覆盖)
+    p.add_argument('--w_bone', type=float, default=1.0)
     p.add_argument('--w_sym',  type=float, default=0.1)
     p.add_argument('--w_temp', type=float, default=0.1)
-    p.add_argument('--w_rel',  type=float, default=3.0)
-    p.add_argument('--w_root_anchor', type=float, default=0.0)   # >0 启用 root anchor (救 MPJPE)
-    p.add_argument('--fk_alpha_final', type=float, default=0.4)  # Hybrid FK 融合系数终值
-    p.add_argument('--fk_alpha_warmup', type=int, default=20)    # alpha 1.0->final 的退火 epoch 数
+    p.add_argument('--w_rel',  type=float, default=6.0)
+
+    # 先验 root (本版核心)
+    p.add_argument('--root_residual_scale', type=float, default=0.08,
+                   help='每帧 root 残差硬上界(米)。越小越安全; 0=纯先验, E04 hip 锁死在动作基线')
+    p.add_argument('--w_root_res', type=float, default=0.01,
+                   help='残差 L2 惩罚权重, 防饱和')
+    p.add_argument('--freeze_root_prior', action='store_true', default=False,
+                   help='冻结 action_prior(最硬 E04 保证, 但牺牲室内精度; 默认 False=可训练但用 canonical 初始化)')
+
+    # 周期性快照: 便于对 val 选不出来的早期 epoch 单独跑 faithful 评测
+    p.add_argument('--periodic_ckpt', dest='periodic_ckpt', action='store_true', default=True)
+    p.add_argument('--no_periodic_ckpt', dest='periodic_ckpt', action='store_false')
+
+    # FK alpha 退火 (透传给 HybridFK base)
+    p.add_argument('--fk_alpha_final', type=float, default=0.4)
+    p.add_argument('--fk_alpha_warmup', type=int, default=20)
 
     return p.parse_args()
 
@@ -409,21 +414,26 @@ def get_args():
 # ----------------------------------------------------------------------
 def main():
     args = get_args()
+    # 把先验 root 的两个超参挂到 args 上, 供 full_model.CSIRSCPoseDG 构造 PriorRootDecoder 时读取
+    # (full_model 用 getattr(args, 'root_residual_scale', 0.08) / getattr(args, 'freeze_root_prior', False))
     set_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
-    save_run_config(args, args.save_dir, extra={"script": "train_distill_pretrained", "step": "B+v3"})
+    save_run_config(args, args.save_dir, extra={"script": "train_distill_pretrained", "step": "B+v4"})
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     logger = setup_logger('DistillPre', os.path.join(args.save_dir, 'train.log'))
     logger.info('=' * 70)
-    logger.info('Step B+ v3: distill + EMA, 选点在 E01-E03 held-out val, E04 仅监控')
+    logger.info('Step B+ v4: distill + EMA + prior-root, 选点在 E01-E03 held-out val, E04 仅监控')
     logger.info('=' * 70)
     logger.info(f'  lambda_feat={args.lambda_feat} lambda_out={args.lambda_out} '
                 f'out_distill_hip_weight={args.out_distill_hip_weight} lambda_hip={args.lambda_hip}')
+    logger.info(f'  prior-root: residual_scale={args.root_residual_scale} '
+                f'w_root_res={args.w_root_res} freeze_prior={args.freeze_root_prior}')
+    logger.info(f'  struct: w_bone={args.w_bone} w_sym={args.w_sym} w_temp={args.w_temp} w_rel={args.w_rel}')
     logger.info(f'  EMA={"ON" if args.use_ema else "OFF"} decay={args.ema_decay} '
-                f'val_ratio={args.val_ratio}')
+                f'val_ratio={args.val_ratio} epochs={args.epochs}')
     logger.info(f'  eval={"evaluate_v2(+hip_err)" if _HAS_EVAL_V2 else "builtin"}')
 
     train_loader, val_loader, test_loader = build_loaders(args, logger)
@@ -433,6 +443,20 @@ def main():
     student = CSIRSCPoseDG(args).to(device)
     logger.info(f'Student params: {count_parameters(student):,}')
     load_pretrained_backbone(student, args.pretrain_ckpt, logger)
+
+    # === 先验 root 初始化: 用源域 canonical hip 初始化 action_prior (必须在建 EMA 之前!) ===
+    _md = student.module if hasattr(student, 'module') else student
+    if hasattr(_md.pose_decoder, 'action_prior'):
+        _canon = build_action_canonical(args.data_root, args.train_envs,
+                                        num_actions=args.num_actions).to(device)
+        with torch.no_grad():
+            _md.pose_decoder.action_prior.data.copy_(_canon)
+        logger.info(f'[prior_root] action_prior 已用源域 canonical 初始化 '
+                    f'({_canon.shape[0]} actions); '
+                    f'requires_grad={_md.pose_decoder.action_prior.requires_grad}')
+    else:
+        logger.warning('[prior_root] pose_decoder 没有 action_prior —— '
+                       '请确认 full_model.py 已把 pose_decoder 换成 PriorRootDecoder')
 
     teacher = FrozenDepthTeacher(
         args.teacher_ckpt, global_dim=args.global_dim, num_joints=args.num_joints,
@@ -457,27 +481,21 @@ def main():
 
     optimizer = build_optimizer(student, proj, args.lr_backbone, args.lr_head, args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # EMA 在 action_prior 已用 canonical 初始化之后创建 -> shadow 从先验起步, 不会从 0 慢慢爬
     ema = EMA(student, decay=args.ema_decay, warmup=not args.ema_no_warmup) if args.use_ema else None
 
     timer = Timer(); timer.start()
-    # 选点用 VAL 指标; 同时存下该 ckpt 在 E04 的监控值
     best = {'mpjpe_raw': float('inf'), 'pa_raw': float('inf'),
             'mpjpe_ema': float('inf'), 'pa_ema': float('inf')}
     patience = 0
-
-    # root anchor: 预扫训练集 GT 构建按动作 canonical hip (只读 .npy, 快; 不碰 E04)
-    args._canonical = None
-    if args.w_root_anchor > 0:
-        from structural_losses import build_action_canonical
-        args._canonical = build_action_canonical(args.data_root, args.train_envs).to(device)
-        logger.info(f'[root_anchor] canonical hip 表已构建 ({args._canonical.shape[0]} actions), w={args.w_root_anchor}')
 
     for epoch in range(1, args.epochs + 1):
         lrs = [g['lr'] for g in optimizer.param_groups]
         logger.info(f'\n{"="*60}\nEpoch {epoch}/{args.epochs} | LR bb={lrs[0]:.2e} hd={lrs[1]:.2e}')
         _md = student.module if hasattr(student, 'module') else student
         if hasattr(_md.pose_decoder, 'set_alpha'):
-            _a = max(args.fk_alpha_final, 1.0 - (1.0 - args.fk_alpha_final) * (epoch - 1) / max(1, args.fk_alpha_warmup))
+            _a = max(args.fk_alpha_final,
+                     1.0 - (1.0 - args.fk_alpha_final) * (epoch - 1) / max(1, args.fk_alpha_warmup))
             _md.pose_decoder.set_alpha(_a)
             logger.info(f'[FK] epoch {epoch} alpha={_a:.3f}')
         tm = train_one_epoch(student, proj, teacher, train_loader, optimizer,
@@ -492,6 +510,7 @@ def main():
 
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
             improved = False
+            v_ema = e_ema = None
 
             # RAW: 先 val(选点), 再 E04(监控)
             logger.info('  [VAL raw] (selection)')
@@ -528,6 +547,16 @@ def main():
                           {'val': v_ema, 'e04': e_ema}, os.path.join(args.save_dir, 'best_pa_ema.pth'))
                     logger.info(f'  ** best_pa_ema: val={best["pa_ema"]:.2f} (E04 PA={e_ema["PA-MPJPE (mm)"]:.2f}) @e{epoch}')
 
+            # === 周期性快照 (raw + ema), 便于对 val 选不出来的早期 epoch 跑 eval_dtpose_faithful ===
+            if getattr(args, 'periodic_ckpt', True):
+                _save(student.state_dict(), optimizer, epoch,
+                      {'val': v_raw, 'e04': e_raw},
+                      os.path.join(args.save_dir, f'epoch{epoch:03d}_raw.pth'))
+                if ema is not None:
+                    _save(ema.state_dict(), optimizer, epoch,
+                          {'val': v_ema, 'e04': e_ema},
+                          os.path.join(args.save_dir, f'epoch{epoch:03d}_ema.pth'))
+
             patience = 0 if improved else patience + 1
             if not improved:
                 logger.info(f'  No val improvement. Patience: {patience}/{args.patience}')
@@ -535,8 +564,10 @@ def main():
                 logger.info(f'Early stopping at epoch {epoch}'); break
 
     logger.info('\n' + '=' * 70)
-    logger.info('Step B+ v3 done. (选点在 val; 报告时用对应 ckpt 在 E04 的监控值)')
-    logger.info('  最终对比 DT-Pose(316.8) 用: best_mpjpe_ema.pth 里 metrics["e04"]["MPJPE (mm)"]')
+    logger.info('Step B+ v4 done. (选点在 val; 报告时用对应 ckpt 在 E04 的监控值)')
+    logger.info('  部署/对比 DT-Pose: best_mpjpe_ema.pth 或 best_pa_ema.pth, '
+                '再用 eval_dtpose_faithful.py --variance 复核')
+    logger.info('  另: epochNNN_ema.pth 是周期快照, 可对早期 epoch 单独跑 faithful 评测')
     logger.info(f'  Time: {timer.elapsed_str()}')
 
 

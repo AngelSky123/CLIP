@@ -1,8 +1,10 @@
 """
 CSI-RSC-PoseDG v7.1 — Action-Conditioned Pose Decoder (Fixed)
   + v8.x: optional ImageNet vision backbone front-end (use_vision_backbone).
-  [ROLLBACK] 退回 366 基线: pose_decoder = PoseDecoder (coarse_head=TaskPromptCoarseHead),
-             已移除路1的 ActionPriorPoseDecoder。forward_decoder 忽略 action_probs。
+  + v9 : pose_decoder = PriorRootDecoder(HybridFKPoseDecoder(...))
+         结构支保持不变, 全局 root 换成 [按动作源域先验 + tanh 限幅小残差]。
+         改 root 在数学上不改 PA-MPJPE / MPJPE_aligned (逐帧去平移),
+         只改 raw MPJPE 的 hip_error 项, 且在未见房间被先验+上界约束。
 
 核心修正:
 1. 修复计算图断裂 (Detach Bug): 真正启用 RSCGlobalChallenger，确保 Mask 操作保留 Backbone 梯度。
@@ -23,13 +25,16 @@ import torch.nn.functional as F
 from .csi_encoder import DualBranchCSIEncoder
 from .local_encoder import LocalSpatioTemporalEncoder, LocalFeaturePooling
 from .global_encoder import GlobalTemporalModeler
-# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 是 366 基线解码器
+# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 仅留作可选回退
 from .pose_decoder import PoseDecoder, ActionClassifier
 
 # 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
 
+# 结构支 (FK Hybrid) + 先验 root 包装器 (二者在仓库根目录, 靠各入口的 sys.path.insert 可见)
 from fk_decoder import HybridFKPoseDecoder
+from prior_root_decoder import PriorRootDecoder
+
 
 class CSIRSCPoseDG(nn.Module):
     def __init__(self, args):
@@ -95,17 +100,23 @@ class CSIRSCPoseDG(nn.Module):
         )
 
         # ------ 初始化 Decoder & Classifier ------
-        # 退回 366 基线: 用原 PoseDecoder (内部 coarse_head = TaskPromptCoarseHead)。
-        # self.pose_decoder = PoseDecoder(
-        #     in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
-        #     gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
-        #     num_joints=args.num_joints, action_embed_dim=action_embed_dim,
-        # )
-        self.pose_decoder = HybridFKPoseDecoder(
+        # 结构支: Hybrid FK 解码器 (内部 base = PoseDecoder(TaskPromptCoarseHead) + FK 分支)。
+        _base_decoder = HybridFKPoseDecoder(
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,
         )
+        # 先验 root 包装: 保留结构支的相对骨架, 把全局 root 换成
+        # [action_prior(软查表) + tanh 限幅残差]。action_prior 由训练脚本用源域
+        # canonical hip 初始化 (在建 EMA 之前)。
+        self.pose_decoder = PriorRootDecoder(
+            _base_decoder,
+            in_dim=args.global_dim,
+            num_actions=args.num_actions,
+            residual_scale=getattr(args, 'root_residual_scale', 0.08),
+            freeze_prior=getattr(args, 'freeze_root_prior', False),
+        )
+
         self.action_classifier = ActionClassifier(
             in_dim=args.global_dim,
             num_actions=args.num_actions,
@@ -128,16 +139,14 @@ class CSIRSCPoseDG(nn.Module):
         return z_local, z_global
 
     def forward_decoder(self, z_global, action_emb, action_probs=None):
-        # 退回 366 基线: 旧 PoseDecoder 只吃 (z_global, action_emb), 忽略 action_probs。
-        # 保留 action_probs 参数签名, 这样 forward / forward_rsc 的调用点一行都不用改。
-        return self.pose_decoder(z_global, action_emb)
+        # PriorRootDecoder 需要 action_probs 做按动作的软查表 (先验 root)。
+        return self.pose_decoder(z_global, action_emb, action_probs)
 
     def forward(self, csi, action_idx=None):
         """Standard forward pass (推理模式)."""
         z_local, z_global = self.forward_backbone(csi)
         action_logits = self.action_classifier(z_global)
 
-        # action_probs 仍算出 (forward_rsc 等沿用), 但退回版 forward_decoder 会忽略它
         action_probs = F.softmax(action_logits, dim=-1)
 
         if action_idx is not None:
