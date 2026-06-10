@@ -48,8 +48,8 @@ WiFi CSI（Channel State Information）作为一种无感（device-free）、不
 2. **RSC（Representation Self-Challenging）**：对全局表征施加时间维 / 通道维 / batch 维随机遮挡，强迫模型分散依赖、避免过拟合单一环境捷径特征，提升跨域鲁棒性。
 3. **结构正则损失套件**（`structural_losses.py`）：骨长一致、左右对称、时序骨长稳定、root-relative 位置对齐——四项损失全部**平移不变**，专门优化 PA-MPJPE 所度量的相对骨架，**结构上不可能恶化全局定位项**。
 4. **Hybrid FK 解码器**（`fk_decoder.py`）：在不替换现有解码器的前提下，外挂一条正运动学（Forward Kinematics）分支（root + 骨长 + 骨方向单位向量 → FK 合成），以 α 退火与原解码器融合；骨架合法性由**构造保证**，是比惩罚项更彻底的 PA 杠杆。
-5. **Root anchor**（诚实修复 MPJPE）：把预测 hip 往按动作的源域 canonical 先验做正则，抑制源域过拟合导致的 root 漂移，使预测 root 不致比常数先验更差——在不接触 E04、不对齐真值的前提下回收"自伤"误差。
-6. **跨房间绝对定位的信息论 limitation 分析**：通过原始输入信息探针、教师误差上界、零信息基线对照、以及对所有候选杠杆的系统性穷举，**量化证明**单链路 CSI 下"人在未见房间里的绝对位置"不可跨域迁移——这是对 WiFi 感知能力边界的实证刻画，本身具有发表价值。
+5. **Root anchor / prior-root**（诚实修复 MPJPE）：把预测 hip 往按动作的源域 canonical 先验做正则（或直接以软查表先验替换 root），抑制源域过拟合导致的 root 漂移，使预测 root 不致比常数先验更差——在不接触 E04、不对齐真值的前提下回收"自伤"误差。
+6. **跨房间绝对定位的信息论 limitation 分析**：通过原始输入信息探针、教师误差上界、零信息基线对照、**专门保尺度的非线性支路反证**、以及对所有候选杠杆的系统性穷举，**量化证明**单链路 CSI 下"人在未见房间里的绝对位置"不可跨域迁移——这是对 WiFi 感知能力边界的实证刻画，本身具有发表价值。
 
 ---
 
@@ -160,6 +160,7 @@ L_anchor = SmoothL1( p_hip, canonical[action] )               # root 往按动�
 
 - **L_bone / L_sym / L_temp / L_rel** 全部基于骨长（关节差）或髋中心化坐标，对全局平移不变 → 只重塑相对骨架，**碰不到 hip 全局 xyz**，结构上保证不恶化 MPJPE 的定位主项。其中 **L_rel** 直接对应 PA-MPJPE 度量的"髋中心相对位置"，是冲击 PA 最对症的杠杆（实测从 105.42 → 104.73）。
 - **L_anchor** 用「按动作的源域平均 hip」作为稳健先验，把预测 hip 往其正则。`canonical[action] ∈ R^(27×3)` 由 `build_action_canonical` 预扫训练集 GT（只读 `ground_truth.npy`，不碰 CSI，很快）得到。这是**源域统计、与 E04 无关**，因此合法。其作用是降低 root 头的方差、抑制源域过拟合漂移，使 root 在 E04 上不致比常数先验更差（§9c）。
+- **prior-root（更彻底的变体，`prior_root_decoder.py`）**：不是软正则，而是直接把 root **替换**为「按动作软查表先验 + tanh 限幅残差」，`--root_residual_scale 0` 时退化为纯先验 root（残差为零）。faithful 实测这是当前把 hip 钉到零信息地板、MPJPE 最优的配置（§8.1）；其残差（scale>0）已被证否（§8.3/§9e），主线固定 `--root_residual_scale 0`。
 
 ### 3.7 总损失
 
@@ -169,7 +170,7 @@ L_total = L_pose(p_clean, g)              # 基础姿态损失 (PoseLoss: lambda
         + lambda_feat · L_distill_feat    # 特征蒸馏
         + lambda_out  · L_distill_out     # 输出蒸馏 (hip 加权)
         + w_bone·L_bone + w_sym·L_sym + w_temp·L_temp + w_rel·L_rel   # 结构正则
-        + w_root_anchor · L_anchor        # root anchor
+        + w_root_anchor · L_anchor        # root anchor (prior-root 变体下可关闭)
 ```
 
 ---
@@ -210,7 +211,7 @@ held-out val：从 E01–E03 中按 `val_ratio=0.15` 留出若干 subjects（实
 
 9 通道 = 3 幅度 + 3 sin + 3 cos。**10 packet 维与 3 天线维全程保留进网络**（已核验，dataloader 不丢弃这两个维度）。短序列以 edge padding 补齐至 `seq_len`。训练集开启 CSI 增广（`augment=True`），测试集关闭增广、用无重叠滑窗（`stride=seq_len`）。
 
-> **重要**：逐帧 min-max 归一化会抹掉绝对幅度量级（路损 / RSSI），相位 detrend 会去掉子载波线性斜率（ToF）。这两者都是潜在的"距离线索"。§9 的探针实验证明：即便保留绝对幅度，这些线索在跨房间下也不可迁移——所以预处理不是 MPJPE 差距的原因。
+> **重要**：逐帧 min-max 归一化会抹掉绝对幅度量级（路损 / RSSI），相位 detrend 会去掉子载波线性斜率（ToF）。这两者都是潜在的"距离线索"。§9 的探针（线性）+ 保尺度非线性支路（§9e）双重实验证明：即便保留绝对幅度 / 天线间相对幅度，这些线索在跨房间下也不可迁移——所以预处理不是 MPJPE 差距的原因。
 
 ---
 
@@ -223,7 +224,7 @@ held-out val：从 E01–E03 中按 `val_ratio=0.15` 留出若干 subjects（实
 | **Stage 1A** | `train_mae.py` | `stage1a_mae/` | （可选）MAE 自监督预训练 backbone |
 | **Stage 1B** | action 预训练 | `stage1b_action/action_best.pt` | 动作监督预训练 backbone |
 | **Teacher** | 深度教师训练 | `depth_teacher_full/teacher_best.pt` | 深度图姿态教师，蒸馏时冻结 |
-| **Distill** | `train_distill_pretrained.py` | `distill_*/best_{mpjpe,pa}_ema.pth` | 在 1B backbone 上蒸馏 + 结构正则 + FK + root anchor，得 CSI-only 学生 |
+| **Distill** | `train_distill_pretrained.py` | `distill_*/best_{mpjpe,pa}_ema.pth` | 在 1B backbone 上蒸馏 + 结构正则 + FK + prior-root，得 CSI-only 学生 |
 
 **为什么部署用 Stage 1B 的 action backbone 而非纯 MAE**：探针实验发现纯 MAE backbone 出现表征塌陷（同/异窗口特征余弦相似度都挤在 ~0.91，margin≈0.001）；而 action-supervised backbone 表征健康（margin / s_diff 正常）。因此主线建立在 1B 之上；MAE-DCL（TC-CL + uniformity）变体已试过，对健康 backbone 无增益，故未采用（见 §9d）。
 
@@ -280,13 +281,15 @@ PCK@τ_norm     = 关节误差 < τ%·(躯干尺度) 的关节占比
 | baseline（TaskPrompt 解码器） | 366.6 | 106.2 | 337.8 | val MPJPE |
 | + 结构正则（骨长/对称/时序，`w_bone=0.5`） | 361.97 | 105.42 | 334.91 | val MPJPE |
 | + root-relative（`w_bone=1.0, w_rel=3.0`） | 363.74 | **104.73** | 334.29 | val MPJPE @e9 |
-| + Hybrid FK + root anchor（`w_rel=6, w_root_anchor=0.5`） | _TBD_ | _TBD_ | _TBD_ | 复合选点 |
+| + Hybrid FK + prior-root（`scale=0`，root=动作软查表先验，钉 hip 到地板） | **358.83** | 104.91 | **327.46** | best_mpjpe_ema（源域 val） |
 | **DT-Pose (S3 / P3)** | **316.8** | **104.2** | — | — |
 
 - PA-MPJPE 多 stride 评测 σ ≈ 0.01–0.02mm，上述 PA 为稳定真值（非噪声）。
-- 当前已确认最优 **PA-MPJPE = 104.73**，与 DT-Pose 104.2 相差 **+0.53mm**（约 0.5mm，处于单链路硬件分辨率地板附近）。
-- 绝对 MPJPE 落后约 45–50mm，差距**全部集中在 hip 全局定位**（见 §9）。
-- 最后一行（Hybrid FK + root anchor）待 `distill_fk_anchor` 训练完成后用 faithful 口径填入。
+- 当前已确认最优 **PA-MPJPE = 104.73**（+root-relative 行），与 DT-Pose 104.2 相差 **+0.53mm**（处于单链路硬件分辨率地板附近）。
+- 当前已确认最优 **MPJPE = 358.83 / hip = 327.46**（prior-root scale=0 行，`best_mpjpe_ema`；`best_pa_ema` 为 359.21 / 104.91 / 327.68，二者按 §10 均列出）。prior-root（scale=0）把 hip 钉至零信息地板（327.46 ≈ 324），较 +root-relative 行 MPJPE 降 ~5mm、hip 降 ~7mm。
+- **两个最优点互不支配**：prior-root 行 MPJPE/hip 最优但 PA 为 104.91（>104.73，且差异 > σ，为真实结构差异、非噪声，`MPJPE_aligned` 121.22 vs 120.24 同向佐证）；+root-relative 行 PA 最优但 MPJPE/hip 落后。取「产出 104.73 的结构配置（`w_rel=3.0`）+ `--root_residual_scale 0`」重训一版以同时支配两点，为计划中的下一步（**尚未完成，不提前填入**）。
+- 绝对 MPJPE 当前落后约 **42mm**，差距**全部集中在 hip 全局定位**（见 §9）。
+- 开残差（`--root_residual_scale 0.3`）在全部 9 个周期 checkpoint 上**均劣于** scale=0（ΔMPJPE +1.6 ~ +33.9mm，均值 ~+19），即非线性残差头学到的幅度→位置映射搬到 E04 是纯增误差；见 §8.3 / §9e。
 
 ### 8.2 PA-MPJPE 消融（结构杠杆有效，且不恶化 MPJPE）
 
@@ -307,13 +310,14 @@ PCK@τ_norm     = 关节误差 < τ%·(躯干尺度) 的关节占比
 | 合规 test-time 重心化（TTA） | 杠杆耗尽在 ~354 | 已用满 |
 | 加大 hip 蒸馏 / lambda_hip | E04 hip 仅 340→337 | 无效 |
 | raw / log 幅度输入救 MPJPE | E04 反向迁移（§9a） | 停止 |
+| 保尺度幅度残差支路（非线性，喂 root 残差头） | faithful：scale=0.3 在全部 9 个 ckpt 均劣于纯先验（ΔMPJPE +1.6 ~ +33.9，均值 ~+19） | 停止（§9e） |
 | post-hoc root fallback（β 混先验） | 诚实选 β（源域）退化为 β≈1 | 无效（见 §10） |
 
 ---
 
 ## 9. Limitation 分析：跨房间绝对定位的信息上界
 
-绝对 MPJPE 的 ~45–50mm 差距**全部集中在 hip 全局定位**，且为信息论上界，非建模不足。四条独立证据：
+绝对 MPJPE 的 ~42mm 差距**全部集中在 hip 全局定位**，且为信息论上界，非建模不足。**五条**独立证据：
 
 ### (a) 原始输入信息探针（`probe_raw_amplitude_hip.py`）
 
@@ -334,13 +338,28 @@ PCK@τ_norm     = 关节误差 < τ%·(躯干尺度) 的关节占比
 
 ### (c) 完整模型 vs 零信息基线（关键）
 
-部署模型在 E04 的 hip_err（~335mm）已**≥** 零信息基线（324mm）—— 即用满全部输入、训练好的非线性模型，在绝对定位上未超过"永远预测平均位置"的常数预测。其中约 11mm 是源域过拟合 / 晚 epoch 漂移造成的"自伤"，可由 root anchor 诚实回收（往稳健先验拉，把 MPJPE 从 ~363 拉回 ~350）；但这**不是"感知出位置"**——CSI 里那部分跨域定位信息确实不存在。
+含残差漂移的部署模型在 E04 的 hip_err（+root-relative 行 334.29mm）已**≥** 零信息基线（324mm）—— 即用满全部输入、训练好的非线性模型，在绝对定位上未超过"永远预测平均位置"的常数预测。把 root 钉到按动作软查表先验（prior-root，`--root_residual_scale 0`）后，faithful hip 收回到 **327.46mm ≈ 324 地板**、MPJPE 从 363.74 降到 **358.83**（§8.1）——回收的是源域过拟合 / 晚 epoch 漂移造成的"自伤"（约 7mm）；但这**不是"感知出位置"**：CSI 里那部分跨域定位信息确实不存在，钉到先验地板就是能做到的极限。
 
 ### (d) 杠杆穷举
 
-解码器结构（多轮）、自监督预训练（MAE-DCL）、合规 TTA、蒸馏权重调参、raw/log 幅度输入、action-prior root、root 解耦解码器 —— 均未移动 hip 误差。
+解码器结构（多轮）、自监督预训练（MAE-DCL）、合规 TTA、蒸馏权重调参、raw/log 幅度输入、action-prior root、root 解耦解码器、**保尺度幅度残差支路（非线性，见 (e)）** —— 均未移动 hip 误差。
 
-**结论**：在严格盲测 / 跨房间 / 单链路 CSI / CSI-only 推理下，绝对 MPJPE 受信息论上界约束；可改善空间在**相对结构（PA-MPJPE）**，本方法已将其推至 SOTA 持平。root anchor 至多把 MPJPE 拉回 ~350（不再难看），追不到 316.8。geometry-conditioned root 需要 E04 房间几何 / 设备标定信息，严格盲测下不可用、不属于本设定的可行方案。DT-Pose 原文亦指出末端关节误差受限于 WiFi 分辨率（需更多设备 / 更高分辨率），与本结论一致。
+### (e) 专门保尺度的非线性支路（faithful 口径直接反证 (a) 的线性盲区）
+
+(a) 的探针是线性岭回归，留一个盲区：也许非线性网络能从保留的幅度尺度里抠出 (a) 抠不到的定位信息。为堵死它，新增一条**专门保尺度**的幅度支路（`raw_scale_encoder.py`）——对幅度做全局归一化（保住天线间相对幅度），**绕开**逐天线 min-max / InstanceNorm / MixStyle，其特征只喂 `prior_root_decoder.py` 的 root 残差头（`residual_scale=0.3`）；结构支 / z_global / RSC / 蒸馏全部不变。训练 25 epoch 后，对全部周期 checkpoint 做 faithful 逐帧评测，逐一对比"开残差(0.3)" vs "纯先验(0)"：
+
+| | E04 hip（纯先验 scale=0） | E04 hip（开残差 scale=0.3） |
+|---|---:|---:|
+| 9 个 checkpoint 范围 | 325.6 – 328.6 | 329.0 – 362.8 |
+| 均值 | ~326.5（≈ 零信息基线 324） | ~349 |
+
+- **开残差在全部 9 个 checkpoint 上都比纯先验差**（ΔMPJPE +1.6 ~ +33.9mm，均值 ~+19）。即非线性残差头学到的幅度→位置映射，搬到 E04 是**纯增误差**——不是没帮上，是主动注入源域噪声。
+- **训练期监控佐证**（仅趋势）：源域 held-out val 的 hip / PA 持续下降（残差头**确实学到了**映射、非死代码），但 E04 hip 全程锁在监控口径 346–350mm 无下行趋势。该支路学到的是**源域房间专属**映射，**跨房间零迁移**。
+- **纯先验 root 的 hip 锁在 ~326mm，等于零信息基线**——用满输入、专门保尺度、非线性，也未超过"永远预测按动作平均位置"。E04 PA 不受影响（root 残差对 PA 数学不变，实测印证）。
+
+这把 (a) 的线性悲观结论，在**非线性 + 专门保尺度**的最有利条件下再次坐实，且是 faithful 口径。主线固定 `--root_residual_scale 0`：保留先验 root，永久关闭这条已证否的残差支路。
+
+**结论**：在严格盲测 / 跨房间 / 单链路 CSI / CSI-only 推理下，绝对 MPJPE 受信息论上界约束；可改善空间在**相对结构（PA-MPJPE）**，本方法已将其推至 SOTA 持平。prior-root 至多把 hip 钉到 ~327 ≈ 324 地板（MPJPE ~359，不再难看），追不到 316.8。geometry-conditioned root 需要 E04 房间几何 / 设备标定信息，严格盲测下不可用、不属于本设定的可行方案。DT-Pose 原文亦指出末端关节误差受限于 WiFi 分辨率（需更多设备 / 更高分辨率），与本结论一致。**第三方佐证**：WiViPose（IEEE TMM 2025，video-aided 双模态，标榜 environment-independent）的绝对位置亦**非端到端学得**，而是另用 Widar 2.0 的 SAGE 算法从 AoA / ToF / Doppler 几何三角定位、并依赖每房间设备标定（其论文 §III-C、Fig 8/9），网络侧只输出相对姿态——即连一篇专做环境无关的 video-aided SOTA，也未让网络从 CSI 端到端恢复跨房间绝对位置。这与本结论一致。
 
 ---
 
@@ -354,8 +373,9 @@ PCK@τ_norm     = 关节误差 < τ%·(躯干尺度) 的关节占比
 
 1. **选点只用源域 held-out val**；E04 永远只作 monitor，不参与任何选点。
 2. **复合选点**：先卡 `MPJPE ≤ baseline+5mm` 且 `root_error ≤ baseline+5mm`，再在满足者中选 PA 最低；防止选到 PA 好但 root 严重漂移的晚 ckpt。
-3. **同时保存 `best_mpjpe_ema` 与 `best_pa_ema` 两个 checkpoint，论文里两者的 E04 数都透明列出**，绝不在 E04 上挑 checkpoint。
-4. **post-hoc root fallback 的诚实性**：`root_final = β·pred_root + (1−β)·prior` 若按源域 val 选 β，则因源域 root 优于常数先验、必然选到 β≈1，对 E04 无任何改善；唯一在 E04 上有用的 β<1 需要看 E04 选，构成泄漏。因此回收 root 自伤（§9c 那 11mm）的合法方式是**训练期 root anchor**（烤进权重、可迁移），而非测试期 fallback。
+3. **同时保存 `best_mpjpe_ema` 与 `best_pa_ema` 两个 checkpoint，论文里两者的 E04 数都透明列出**，绝不在 E04 上挑 checkpoint。（例：§8.1 prior-root 行的 `best_mpjpe_ema` = 358.83/104.91/327.46，`best_pa_ema` = 359.21/104.91/327.68，二者一并列出。）
+4. **post-hoc root fallback 的诚实性**：`root_final = β·pred_root + (1−β)·prior` 若按源域 val 选 β，则因源域 root 优于常数先验、必然选到 β≈1，对 E04 无任何改善；唯一在 E04 上有用的 β<1 需要看 E04 选，构成泄漏。因此回收 root 自伤（§9c 那部分）的合法方式是**训练期 prior-root / root anchor**（烤进权重、可迁移），而非测试期 fallback。
+5. **prior-root 残差的 scale 是 forward 乘数、非学习权重**：评测脚本（`eval_dtpose_faithful.py` / `viz_eval.py`）的 `--root_residual_scale` 必须与训练一致，否则加载的残差头权重被错误缩放、预测全错。主线统一 `0`。
 
 ---
 
@@ -391,7 +411,9 @@ self.pose_decoder = HybridFKPoseDecoder(
 
 原 `from .pose_decoder import PoseDecoder, ActionClassifier` 行保留（ActionClassifier 仍需用）。其余 forward / RSC / 蒸馏 / 评测一行不改。
 
-### 11.4 训练（当前版本：结构正则 + Hybrid FK + root anchor）
+> prior-root 变体（§3.6 末、§9e）：将 `HybridFKPoseDecoder` 实例再用 `PriorRootDecoder(...)` 包一层，训练/评测统一 `--root_residual_scale 0`（关残差，纯动作先验 root）。该路径的残差（scale>0）已证否，仅作 §9e 实验，不属主线。
+
+### 11.4 训练（当前版本：结构正则 + Hybrid FK + root anchor / prior-root）
 
 ```bash
 python train_distill_pretrained.py \
@@ -400,14 +422,14 @@ python train_distill_pretrained.py \
     --pretrain_ckpt checkpoints/stage1b_action/action_best.pt \
     --teacher_ckpt  checkpoints/depth_teacher_full/teacher_best.pt \
     --depth_img 112 --depth_clip 5000 \
-    --w_bone 1.0 --w_sym 0.1 --w_temp 0.1 --w_rel 6.0 \
-    --w_root_anchor 0.5 --fk_alpha_final 0.4 --fk_alpha_warmup 20 \
-    --epochs 50 --batch_size 2 --accumulate_grad 8 \
+    --w_bone 1.0 --w_sym 0.1 --w_temp 0.1 --w_rel 3.0 \
+    --root_residual_scale 0.0 --fk_alpha_final 0.4 --fk_alpha_warmup 20 \
+    --epochs 25 --batch_size 2 --accumulate_grad 8 \
     --use_ema --ema_decay 0.999 --seed 42 \
-    --save_dir ./checkpoints/distill_fk_anchor
+    --save_dir ./checkpoints/distill_priorroot
 ```
 
-显存提示：RTX 4080 16GB 下 `batch_size=2 + accumulate_grad=8`（等效 batch 16）。OOM 时降 batch、提 accum。可 `grep "\[FK\]" 日志` 确认 α 从 1.000 平滑退到 0.400。
+显存提示：RTX 4080 16GB 下 `batch_size=2 + accumulate_grad=8`（等效 batch 16）。OOM 时降 batch、提 accum。可 `grep "\[FK\]" 日志` 确认 α 从 1.000 平滑退到 0.400。注：`--w_rel 3.0` 是复现 PA=104.73 的关键（6.0 会让 PA 退到 ~104.9）；`--root_residual_scale 0` 关闭已证否的残差、保留纯先验 root。
 
 ### 11.5 评测（唯一权威口径；两个 ckpt 都评）
 
@@ -415,13 +437,27 @@ python train_distill_pretrained.py \
 for c in best_mpjpe_ema best_pa_ema; do
   echo "==== $c ===="
   python eval_dtpose_faithful.py --data_root /path/to/MMFi \
-      --ckpt ./checkpoints/distill_fk_anchor/$c.pth --test_env E04 --seq_len 64 --variance
+      --ckpt ./checkpoints/distill_priorroot/$c.pth --test_env E04 --seq_len 64 \
+      --root_residual_scale 0 --rawscale_mode full --variance
 done
 ```
 
-`--variance` 跑多 stride 报 mean±σ，用于判断指标领先是否超过评测口径噪声（领先 ≤ σ 只能写"持平"）。
+`--variance` 跑多 stride 报 mean±σ，用于判断指标领先是否超过评测口径噪声（领先 ≤ σ 只能写"持平"）。`--root_residual_scale` 必须与训练一致（§10 纪律 5）。
 
-### 11.6 信息上界探针（§9 复现）
+### 11.6 评测可视化（`viz_eval.py`，与 faithful 同源）
+
+```bash
+# 单 ckpt 诊断: 误差分解 / 逐关节 / 逐动作 / 逐轴 root 漂移 / hip 分布
+python viz_eval.py --data_root /path/to/MMFi \
+    --ckpt ./checkpoints/distill_priorroot/best_mpjpe_ema.pth --test_env E04 \
+    --root_residual_scale 0 --rawscale_mode full --out_dir ./viz_out
+# 多 ckpt 扫描曲线 (帮你挑 MPJPE 最低且合规的 ckpt)
+python viz_eval.py --data_root /path/to/MMFi \
+    --sweep 'checkpoints/distill_priorroot/epoch*_raw.pth' --test_env E04 \
+    --root_residual_scale 0 --rawscale_mode full --out_dir ./viz_out
+```
+
+### 11.7 信息上界探针（§9a 复现）
 
 ```bash
 python probe_raw_amplitude_hip.py --data_root /path/to/MMFi \
@@ -447,10 +483,12 @@ python probe_raw_amplitude_hip.py --data_root /path/to/MMFi \
 | **结构** | `--w_bone` | 1.0 | 骨长损失 |
 | **结构** | `--w_sym` | 0.1 | 左右对称 |
 | **结构** | `--w_temp` | 0.1 | 时序骨长稳定 |
-| **结构** | `--w_rel` | 6.0 | root-relative 位置 (PA 主杠杆) |
+| **结构** | `--w_rel` | 3.0 | root-relative 位置 (PA 主杠杆; 复现 104.73 用 3.0) |
 | **FK** | `--fk_alpha_final` | 0.4 | Hybrid FK 融合系数终值 |
 | **FK** | `--fk_alpha_warmup` | 20 | α 由 1.0→final 的退火 epoch 数 |
-| **root** | `--w_root_anchor` | 0.0 | root anchor 强度（>0 启用，救 MPJPE） |
+| **root** | `--w_root_anchor` | 0.0 | root anchor 强度（>0 启用 L_anchor 软正则） |
+| **root** | `--root_residual_scale` | 0.0 | prior-root 残差硬上界(米)；**0=纯先验(主线)**，>0 已证否(§9e) |
+| **root** | `--rawscale_mode` | full | 保尺度支路 mode (full/pool)；评测须与训练一致 |
 | RSC | `--rsc2_time/channel/batch_pct` | 0.5/0.5/0.5 | RSC challenge 比例 |
 | 网络 | `--global_dim` | 128 | 全局特征维 |
 | 网络 | `--num_transformer_layers` / `--num_heads` | 3 / 4 | Transformer |
@@ -461,7 +499,7 @@ python probe_raw_amplitude_hip.py --data_root /path/to/MMFi \
 | 优化 | `--weight_decay` | 1e-3 | |
 | 优化 | `--grad_clip` | 1.0 | |
 | 优化 | `--batch_size` / `--accumulate_grad` | 2 / 8 | 等效 batch 16 |
-| 优化 | `--epochs` / `--patience` | 50 / 15 | 早停 patience |
+| 优化 | `--epochs` / `--patience` | 25 / 15 | 早停 patience |
 | EMA | `--use_ema` / `--ema_decay` | True / 0.999 | 浮点 buffer(含 FK α) 会被 EMA 跟踪 |
 | 评测 | `--eval_interval` | 3 | 每 N epoch 评一次 |
 | 复现 | `--seed` | 42 | |
@@ -472,15 +510,18 @@ python probe_raw_amplitude_hip.py --data_root /path/to/MMFi \
 
 ```
 RSC V2/
-├── train_distill_pretrained.py   # 主训练: 蒸馏+EMA+held-out选点+结构正则+FK退火+root anchor
+├── train_distill_pretrained.py   # 主训练: 蒸馏+EMA+held-out选点+结构正则+FK退火+prior-root
 ├── train_mae.py                  # Stage 1A: MAE 自监督预训练 (可选)
 ├── fk_decoder.py                 # Hybrid FK 解码器 (结构支 + FK 支 + α 融合 + 正运动学)
+├── prior_root_decoder.py         # (§9e 实验支路) 先验 root 包装: root=动作软查表先验+限幅残差; 主线 --root_residual_scale 0 关残差
+├── raw_scale_encoder.py          # (§9e 实验支路) 保尺度幅度支路(全局归一化,绕开 InstanceNorm/MixStyle); 已证否
 ├── structural_losses.py          # 骨长/对称/时序/root-relative/root-anchor + canonical 构建
 ├── eval_dtpose_faithful.py       # 逐帧 faithful 评测 (与 DT-Pose 对齐的权威口径)
+├── viz_eval.py                   # 评测结果可视化(faithful 同源): 误差分解/逐关节/逐动作/root 漂移/多 ckpt sweep
 ├── evaluate.py                   # 训练期监控评测 (evaluate_v2, 滑窗, 不用于报告)
 ├── probe_raw_amplitude_hip.py    # 原始幅度 → E04 hip 信息探针 (§9 分析依据)
 ├── dataset.py                    # MMFi CSI/GT 加载 + 预处理 + 增广
-├── dataset_distill.py            # 蒸馏数据加载 (csi + depth 配对)
+├── dataset_distill.py            # 蒸馏数据加载 (csi + depth 配对; 含 csi_rawscale 保尺度支路)
 ├── augmentation.py               # CSI 数据增广
 ├── losses.py                     # PoseLoss / TotalLoss
 ├── distill_loss.py               # DistillProjection / FeatureDistillLoss / OutputDistillLoss
@@ -488,13 +529,13 @@ RSC V2/
 ├── action_prior_root.py          # (路1 备选) 动作×相位先验 root 损失, 已门控
 ├── utils.py                      # set_seed / logger / 参数统计等
 ├── models/
-│   ├── full_model.py             # CSIRSCPoseDG (在此把 pose_decoder 换成 HybridFKPoseDecoder)
+│   ├── full_model.py             # CSIRSCPoseDG (在此把 pose_decoder 换成 HybridFKPoseDecoder / PriorRootDecoder)
 │   ├── pose_decoder.py           # PoseDecoder / CoarsePoseHead / SkeletonRefiner / ActionClassifier
 │   └── depth_teacher.py          # DepthPoseTeacher
 └── checkpoints/
     ├── stage1b_action/action_best.pt
     ├── depth_teacher_full/teacher_best.pt
-    └── distill_fk_anchor/best_{mpjpe,pa}_ema.pth
+    └── distill_priorroot/best_{mpjpe,pa}_ema.pth
 ```
 
 ---
@@ -503,13 +544,14 @@ RSC V2/
 
 - **`AttributeError: 'PoseDecoder' object has no attribute 'root_head'`**：路1 的 `root_prior_losses` 已按 `hasattr(decoder,'root_head')` 门控；TaskPrompt / Hybrid FK 基线无 root_head，自动跳过。
 - **ckpt 加载后全是噪声**：检查日志 `missing / unexpected`，>8 即模型定义与 ckpt 不配套；改代码后务必 `rm -rf **/__pycache__`。
+- **prior-root 评测全错**：`--root_residual_scale` 是 forward 乘数、非学习权重，评测必须与训练一致（主线 0）；用错值会让残差头权重被错误缩放、预测全错（§10 纪律 5）。
 - **EMA ckpt 直接是 shadow dict**：`best_*_ema.pth` 已是 EMA 权重，评测直接加载。
 - **FK α 与 EMA**：α 是浮点 buffer；EMA `update` 对浮点 buffer 做 EMA 平均，故 EMA shadow 的 α 会平滑跟踪到 `fk_alpha_final`，评测自动用最终 α，不会卡在 1.0（无需手动同步）。
-- **监控值远好于 faithful**：训练期滑窗监控 (stride + padding) 会失真，差可达 100mm+，**只认 `eval_dtpose_faithful.py`**。
+- **监控值远好于 faithful**：训练期滑窗监控 (stride + padding) 会失真，差可达 100mm+，**只认 `eval_dtpose_faithful.py`**；滑窗值至多用于趋势判断（§9e），绝对值不入结论。
 - **PA 早熟、晚 epoch 漂移**：见 §10，必须复合选点、两个 ckpt 都评都报。
 - **探针 raw_abs 出 NaN**：原始 `CSIamp` 含 inf，须先 `nan_to_num(posinf=0)` + 裁剪（`probe_raw_amplitude_hip.py` v2 已修）。
-- **PA / MPJPE_aligned 对全局平移不变**：可作 sanity——若改动只该影响结构，这两项应随 MPJPE 同向但 hip_err 不变；反之说明动到了 root。
-- **OOM**：降 `--batch_size`、提 `--accumulate_grad` 维持等效 batch；对比类损失（mae_dcl）需较大 batch，4080 上 batch16 易 OOM。
+- **PA / MPJPE_aligned 对全局平移不变**：可作 sanity——若改动只该影响结构，这两项应随 MPJPE 同向但 hip_err 不变；反之说明动到了 root。prior-root 改 root 时这两项逐位不变，已实测验证。
+- **OOM**：降 `--batch_size`、提 `--accumulate_grad` 维持等效 batch；保尺度支路 OOM 时把 `--rawscale_mode full` 改 `pool`。
 
 ---
 
@@ -518,11 +560,13 @@ RSC V2/
 ### 15.1 诚实声明
 
 - 报告的所有数均来自**严格盲测**（E04 训练期从不可见）+ **faithful 逐帧口径**，无 GT 动作标签泄露、无对 E04 真值的对齐、无 transductive 偷看、不在 E04 上选 checkpoint / 选 β。
-- **PA-MPJPE 当前最优 104.73，与 DT-Pose 104.2 持平**（相差约 0.5mm，处于单链路硬件分辨率地板附近）。是否能稳定反超取决于 Hybrid FK 一轮结果，将据 faithful 真数如实更新，**不提前声称**。
-- **绝对 MPJPE 落后约 45–50mm**，归因于跨房间绝对定位的信息论上界（§9 给出测量证据）；root anchor 至多回收源域过拟合自伤的 ~11mm（→ ~350），**不声称追平 316.8**。
+- **PA-MPJPE 当前最优 104.73**（+root-relative 行），与 DT-Pose 104.2 相差约 0.5mm（处于单链路硬件分辨率地板附近）。prior-root（scale=0）一版 PA 为 104.91，未破 104.73；取「好结构（`w_rel=3.0`）+ prior-root」以同时支配 MPJPE 与 PA 的定稿为计划中的下一步，将据 faithful 真数如实更新，**不提前声称**。
+- **绝对 MPJPE 当前最优 358.83 / hip 327.46**（prior-root scale=0，`best_mpjpe_ema`），较 DT-Pose 316.8 落后约 42mm，归因于跨房间绝对定位的信息论上界（§9 给出 5 条测量证据）；prior-root 已把 hip 钉到 ~327 ≈ 324 零信息地板，回收源域漂移自伤后 **不声称追平 316.8**。
+- 保尺度幅度残差（`--root_residual_scale 0.3`）已被 faithful 口径证否（全部 9 个 ckpt 劣于 scale=0，§9e），主线固定为 0。
 - 任何低于 faithful 报告值的数（训练期滑窗监控、含 GT 动作标签、对 E04 真值对齐、E04 选点 / 选 β）一律**不作为结论**。
 
 ### 15.2 参考
 
 - DT-Pose: *Towards Robust and Realistic Human Pose Estimation via WiFi Signals* (arXiv:2501.09411)
 - MM-Fi: *Multi-Modal Non-Intrusive 4D Human Dataset for Versatile Wireless Sensing* (arXiv:2305.10345)，Toolbox: github.com/ybhbingo/MMFi_dataset
+- WiViPose: *A Video-Aided Wi-Fi Framework for Environment-Independent 3D Human Pose Estimation*, IEEE TMM, vol. 27, 2025（其绝对定位用 Widar 2.0 SAGE 几何三角化 + 每房间设备标定、网络侧只出相对姿态，佐证 §9 信息上界）
