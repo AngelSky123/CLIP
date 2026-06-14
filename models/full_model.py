@@ -1,22 +1,16 @@
 """
-CSI-RSC-PoseDG v7.1 — Action-Conditioned Pose Decoder (Fixed)
-  + v8.x: optional ImageNet vision backbone front-end (use_vision_backbone).
-  + v9 : pose_decoder = PriorRootDecoder(HybridFKPoseDecoder(...))
-         结构支保持不变, 全局 root 换成 [按动作源域先验 + tanh 限幅小残差]。
-         改 root 在数学上不改 PA-MPJPE / MPJPE_aligned (逐帧去平移),
-         只改 raw MPJPE 的 hip_error 项, 且在未见房间被先验+上界约束。
+CSI-RSC-PoseDG v9 (B+v3 回退版) — 纯 Hybrid FK 解码器
+  pose_decoder = HybridFKPoseDecoder(...)  (结构支 + FK 支 + α 融合)
+  root anchor 以【损失项】形式 (L_anchor) 在 trainer 里施加 (--w_root_anchor)。
 
-核心修正:
-1. 修复计算图断裂 (Detach Bug): 真正启用 RSCGlobalChallenger，确保 Mask 操作保留 Backbone 梯度。
-2. 动作特征随机失活 (Action Dropout): 训练时 50% 概率阻断 Action 先验，彻底解决跨域时的级联失效。
+本版【移除】了后续 rawscale 实验的两处附加 (已证否, 见 README §9e):
+  - raw_scale_encoder 支路 (整条删除)
+  - PriorRootDecoder 包装 (root 退回 FK 直接预测 + L_anchor 软正则)
+其余 (RSC / action dropout / 蒸馏 / vision backbone 分支) 一行不动。
 
-NEW — Vision backbone option:
-  If args.use_vision_backbone is True, the (csi_encoder + local_encoder +
-  feature_pooling) trio is replaced by a single VisionBackboneEncoder that maps
-  each CSI frame (9,114,10) through an ImageNet-pretrained backbone and outputs a
-  per-frame feature sequence (B, T, global_dim). GlobalTemporalModeler, RSC,
-  PoseDecoder, ActionClassifier and BOTH forward paths are unchanged.
-  Default is False -> identical behaviour to the original model.
+核心机制 (沿用):
+1. RSCGlobalChallenger 真正启用, Mask 保留 backbone 梯度。
+2. Action Dropout: 训练时 50% 概率阻断 action_emb。
 """
 import torch
 import torch.nn as nn
@@ -25,15 +19,11 @@ import torch.nn.functional as F
 from .csi_encoder import DualBranchCSIEncoder
 from .local_encoder import LocalSpatioTemporalEncoder, LocalFeaturePooling
 from .global_encoder import GlobalTemporalModeler
-# ActionClassifier 必须保留 (forward 里用到); PoseDecoder 仅留作可选回退
 from .pose_decoder import PoseDecoder, ActionClassifier
-
-# 核心修正：引入你已经写好但之前被闲置的 RSC 模块
 from .rsc import RSCGlobalChallenger
 
-# 结构支 (FK Hybrid) + 先验 root 包装器 (二者在仓库根目录, 靠各入口的 sys.path.insert 可见)
+# 结构支 (FK Hybrid) 在仓库根目录, 靠各入口 sys.path.insert 可见
 from fk_decoder import HybridFKPoseDecoder
-from prior_root_decoder import PriorRootDecoder
 
 
 class CSIRSCPoseDG(nn.Module):
@@ -43,17 +33,14 @@ class CSIRSCPoseDG(nn.Module):
         self._debug_printed = False
 
         action_embed_dim = 32
-
-        # ------ NEW: choose front-end (original CSI trio vs vision backbone) ------
         self.use_vision_backbone = getattr(args, 'use_vision_backbone', False)
 
         if self.use_vision_backbone:
-            # Lazy import so non-vision users don't need timm installed.
             from .vision_backbone import VisionBackboneEncoder
             self.vision_backbone = VisionBackboneEncoder(
                 in_channels=getattr(args, 'vision_in_channels',
                                     args.amp_channels + args.phase_channels),
-                out_dim=args.global_dim,                 # MUST equal global_modeler in_dim
+                out_dim=args.global_dim,
                 arch=getattr(args, 'vision_arch', 'resnet18'),
                 pretrained=not getattr(args, 'vision_scratch', False),
                 img_size=getattr(args, 'vision_img_size', 112),
@@ -62,7 +49,6 @@ class CSIRSCPoseDG(nn.Module):
                 weights_path=getattr(args, 'vision_weights', None),
             )
         else:
-            # ------ 原始 Backbone ------
             self.csi_encoder = DualBranchCSIEncoder(
                 amp_channels=args.amp_channels,
                 phase_channels=args.phase_channels,
@@ -80,7 +66,6 @@ class CSIRSCPoseDG(nn.Module):
                 out_channels=args.global_dim,
             )
 
-        # ------ 全局时序建模器 (always present, unchanged) ------
         self.global_modeler = GlobalTemporalModeler(
             in_dim=args.global_dim,
             global_dim=args.global_dim,
@@ -92,29 +77,17 @@ class CSIRSCPoseDG(nn.Module):
             max_seq_len=args.seq_len + 50,
         )
 
-        # ------ 核心修正：实例化多维特征自挑战模块 ------
         self.rsc_global = RSCGlobalChallenger(
             time_drop_pct=getattr(args, 'rsc2_time_drop_pct', 0.5),
             channel_drop_pct=getattr(args, 'rsc2_channel_drop_pct', 0.5),
             batch_pct=getattr(args, 'rsc2_batch_pct', 0.5)
         )
 
-        # ------ 初始化 Decoder & Classifier ------
-        # 结构支: Hybrid FK 解码器 (内部 base = PoseDecoder(TaskPromptCoarseHead) + FK 分支)。
-        _base_decoder = HybridFKPoseDecoder(
+        # ------ Decoder & Classifier (纯 Hybrid FK, 无 prior-root 包装) ------
+        self.pose_decoder = HybridFKPoseDecoder(
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,
-        )
-        # 先验 root 包装: 保留结构支的相对骨架, 把全局 root 换成
-        # [action_prior(软查表) + tanh 限幅残差]。action_prior 由训练脚本用源域
-        # canonical hip 初始化 (在建 EMA 之前)。
-        self.pose_decoder = PriorRootDecoder(
-            _base_decoder,
-            in_dim=args.global_dim,
-            num_actions=args.num_actions,
-            residual_scale=getattr(args, 'root_residual_scale', 0.08),
-            freeze_prior=getattr(args, 'freeze_root_prior', False),
         )
 
         self.action_classifier = ActionClassifier(
@@ -125,40 +98,30 @@ class CSIRSCPoseDG(nn.Module):
 
     def forward_backbone(self, csi):
         if self.use_vision_backbone:
-            # Vision path: per-frame ImageNet features -> temporal model.
-            z_seq = self.vision_backbone(csi)          # (B, T, global_dim)
+            z_seq = self.vision_backbone(csi)
             z_global = self.global_modeler(z_seq)
-            # z_local is unused by losses/RSC downstream; return z_seq as a
-            # harmless placeholder to keep the (z_local, z_global) contract.
             return z_seq, z_global
-
         feat = self.csi_encoder(csi)
         z_local = self.local_encoder(feat)
         z_pooled = self.feature_pooling(z_local)
         z_global = self.global_modeler(z_pooled)
         return z_local, z_global
 
-    def forward_decoder(self, z_global, action_emb, action_probs=None):
-        # PriorRootDecoder 需要 action_probs 做按动作的软查表 (先验 root)。
-        return self.pose_decoder(z_global, action_emb, action_probs)
+    def forward_decoder(self, z_global, action_emb):
+        # HybridFKPoseDecoder: forward(z_global, action_emb) -> (p_coarse, p_final)
+        return self.pose_decoder(z_global, action_emb)
 
     def forward(self, csi, action_idx=None):
-        """Standard forward pass (推理模式)."""
         z_local, z_global = self.forward_backbone(csi)
         action_logits = self.action_classifier(z_global)
-
         action_probs = F.softmax(action_logits, dim=-1)
 
         if action_idx is not None:
-            action_emb = self.action_classifier.get_action_embedding(
-                action_idx=action_idx
-            )
+            action_emb = self.action_classifier.get_action_embedding(action_idx=action_idx)
         else:
-            action_emb = self.action_classifier.get_action_embedding(
-                action_probs=action_probs
-            )
+            action_emb = self.action_classifier.get_action_embedding(action_probs=action_probs)
 
-        p_coarse, p_final = self.forward_decoder(z_global, action_emb, action_probs)
+        p_coarse, p_final = self.forward_decoder(z_global, action_emb)
 
         return {
             'p_coarse': p_coarse,
@@ -169,63 +132,48 @@ class CSIRSCPoseDG(nn.Module):
         }
 
     def forward_rsc(self, csi, pose_3d, loss_fn, action_idx=None):
-        """RSC 训练模式：携带梯度修复与动作先验解耦"""
-        # Step 1: Backbone 前向传播
+        """RSC 训练模式: 携带梯度修复与动作先验解耦。"""
         z_local, z_global_raw = self.forward_backbone(csi)
 
-        # 动作分类与 Embedding
         action_logits = self.action_classifier(z_global_raw)
-        # action_probs 始终算出来, 喂给先验 root (与 action_emb 的 dropout 无关)
         action_probs = F.softmax(action_logits, dim=-1)
         if action_idx is not None:
             action_emb = self.action_classifier.get_action_embedding(action_idx)
         else:
             action_emb = self.action_classifier.get_action_embedding(action_probs=action_probs)
 
-        # === 修复 2：Action Dropout (动作特征解耦) ===
-        # 注意: 只 dropout action_emb (相对骨架的动作条件), 不 dropout action_probs
-        # (全局位置先验是独立机制, 始终保留)。
+        # Action Dropout: 训练时 50% 概率阻断 action_emb (相对骨架的动作条件)
         if self.training and torch.rand(1).item() < 0.5:
             action_emb_for_decoder = torch.zeros_like(action_emb)
         else:
             action_emb_for_decoder = action_emb
 
-        # Step 2A: 干净路径 (主图，负责传递绝大部分基础梯度)
-        p_coarse_clean, p_final_clean = self.forward_decoder(
-            z_global_raw, action_emb_for_decoder, action_probs
-        )
+        # Step 2A: 干净路径 (主图)
+        p_coarse_clean, p_final_clean = self.forward_decoder(z_global_raw, action_emb_for_decoder)
 
-        # Step 3: RSC 梯度计算 (在分离的图上寻找主导特征)
+        # Step 3: RSC 梯度 (分离图上找主导特征)
         z_global_detached = z_global_raw.detach().clone().requires_grad_(True)
-        _, p_final_for_grad = self.forward_decoder(
-            z_global_detached, action_emb_for_decoder.detach(), action_probs.detach()
-        )
-
+        _, p_final_for_grad = self.forward_decoder(z_global_detached, action_emb_for_decoder.detach())
         loss_for_grad = loss_fn(p_final_for_grad, pose_3d)
         grad_global = torch.autograd.grad(
             loss_for_grad, z_global_detached,
             create_graph=False, retain_graph=False,
         )[0]
 
-        # Step 4: RSC Masking (特征自挑战应用) — 保留 Backbone 梯度
-        z_global_masked = self.rsc_global(
-            z_global_raw, grad_global.detach()
-        )
+        # Step 4: RSC Masking (保留 backbone 梯度)
+        z_global_masked = self.rsc_global(z_global_raw, grad_global.detach())
 
-        # Debug 打印监控
         if not self._debug_printed:
             with torch.no_grad():
                 diff = (z_global_raw.detach() - z_global_masked.detach()).abs()
                 pct = 100.0 * (diff > 1e-8).float().sum().item() / diff.numel()
             print(f"[RSC DEBUG] z_global: {z_global_raw.shape}, "
-                  f"masked {pct:.1f}%, "
-                  f"grad_norm={grad_global.abs().mean():.6f}")
+                  f"masked {pct:.1f}%, grad_norm={grad_global.abs().mean():.6f}")
             self._debug_printed = True
 
-        # Step 5: 被 Mask 后的解码 (迫使网络发掘次优特征)
+        # Step 5: 被 Mask 后的解码
         p_coarse_masked, p_final_masked = self.forward_decoder(
-            z_global_masked, action_emb_for_decoder.detach(), action_probs.detach()
-        )
+            z_global_masked, action_emb_for_decoder.detach())
 
         return {
             'p_coarse_clean': p_coarse_clean,
