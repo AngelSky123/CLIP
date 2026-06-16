@@ -88,6 +88,8 @@ class CSIRSCPoseDG(nn.Module):
             in_dim=args.global_dim, hidden_dim=args.coarse_hidden_dim,
             gcn_hidden=args.gcn_hidden_dim, num_gcn_layers=args.num_gcn_layers,
             num_joints=args.num_joints, action_embed_dim=action_embed_dim,
+            root_mode=getattr(args, 'root_mode', 'absolute'),      # 新增
+            vel_scale=getattr(args, 'vel_scale', 0.12),            # 新增
         )
 
         self.action_classifier = ActionClassifier(

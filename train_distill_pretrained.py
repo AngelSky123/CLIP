@@ -14,6 +14,22 @@ Step B+v3: depth/RGB -> CSI 蒸馏, 从 Stage1B 预训练 backbone 出发。
   * 蒸馏损失/管线一行不变, 只换教师与教师输入。
   * RGB 教师的 hip 不可信 (单目无米制深度), 建议 --out_distill_hip_weight 1.0
     (depth 默认 4.0 不变; rgb 模态下若未显式指定则自动降为 1.0, 日志会打印)。
+
+============================================================================
+本次新增 (打 hip / MPJPE 的三个实验开关, 默认全部保持原行为):
+  [1] 输出蒸馏 hip 对齐  --out_distill_align_hip / --no_out_distill_align_hip
+      默认随模态: rgb 自动 True (各自减 hip 后只蒸馏相对结构, 不把单目教师那条
+      不可信的绝对 hip 灌给学生, 保护学生 PA), depth 默认 False (原行为)。
+      需要 distill_loss.OutputDistillLoss 已含 align_hip 参数。
+  [2] L_anchor 退火     --anchor_anneal_epochs N (>0 开启) / --w_root_anchor_final F
+      前期强按住 root 附近防漂, 后期线性退火到 F, 让网络敢学轨迹。N=0 时为原行为。
+  [3] 速度积分 root      --root_mode {absolute(原), velocity} / --vel_scale
+      velocity: hip = 锚 + 去均值的速度积分轨迹 (接 fk_decoder.py 的 FKBranch)。
+      ★ 需 full_model.py 把 args.root_mode/args.vel_scale 透传给 HybridFKPoseDecoder
+        (见文件末尾说明)。未透传时本开关不生效但不报错。
+      velocity 模式下 L_anchor 只约束【时间均值 hip = canonical】, 放开轨迹,
+      否则逐帧 anchor 会把速度积分学到的轨迹重新摁平。
+============================================================================
 """
 import os
 import sys
@@ -192,6 +208,9 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
     use_feat = args.lambda_feat > 0
     use_out  = args.lambda_out  > 0
     tkey = args.teacher_modality          # 'depth' or 'rgb' -> batch key
+    # L_anchor 当前权重 (epoch 循环里按退火设到 args._w_anchor_cur; 缺省回退到原 w_root_anchor)
+    w_anchor_cur = getattr(args, '_w_anchor_cur', args.w_root_anchor)
+    vel_mode = (getattr(args, 'root_mode', 'absolute') == 'velocity')
 
     for i, batch in enumerate(loader):
         csi = batch['csi'].to(device)
@@ -228,12 +247,16 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
         total = total + l_struct
         meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
 
-        # === root anchor ===
-        if args.w_root_anchor > 0 and canonical is not None:
-            pred_hip = outputs['p_final_clean'][:, :, 0, :]
-            tgt_hip = canonical[action_labels]
-            l_anchor = F.smooth_l1_loss(pred_hip, tgt_hip[:, None, :].expand_as(pred_hip))
-            total = total + args.w_root_anchor * l_anchor
+        # === root anchor (支持退火 + velocity 模式只约束时间均值) ===
+        if w_anchor_cur > 0 and canonical is not None:
+            pred_hip = outputs['p_final_clean'][:, :, 0, :]      # (B,T,3)
+            tgt_hip = canonical[action_labels]                   # (B,3)
+            if vel_mode:
+                # 只把【时间均值 hip】拉向 canonical, 放开零均值轨迹 (否则会摁平速度积分)
+                l_anchor = F.smooth_l1_loss(pred_hip.mean(dim=1), tgt_hip)
+            else:
+                l_anchor = F.smooth_l1_loss(pred_hip, tgt_hip[:, None, :].expand_as(pred_hip))
+            total = total + w_anchor_cur * l_anchor
             meters['l_anchor'].update(float(l_anchor.detach()), csi.shape[0])
 
         (total / accum).backward()
@@ -253,8 +276,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
                    f'Pose(C): {meters["l_pose_clean"].avg:.4f} Act: {meters["l_action"].avg:.4f}')
             msg += f' Struct: {meters["l_struct"].avg:.4f}'
             msg += f" [bone={struct_d.get('bone',0):.3f} rel={struct_d.get('rel',0):.3f}]"
-            if args.w_root_anchor > 0:
-                msg += f' Anchor: {meters["l_anchor"].avg:.4f}'
+            if w_anchor_cur > 0:
+                msg += f' Anchor: {meters["l_anchor"].avg:.4f}(w={w_anchor_cur:.2f})'
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
@@ -325,6 +348,12 @@ def get_args():
     p.add_argument('--out_distill_beta', type=float, default=0.05)
     p.add_argument('--out_distill_hip_weight', type=float, default=None,
                    help='默认: depth=4.0, rgb=1.0 (RGB 教师 hip 不可信)。显式指定则覆盖。')
+    # [1] 输出蒸馏 hip 对齐 (RGB 自动开, 保护学生 PA 不被单目教师那条绝对 hip 毒化)
+    p.add_argument('--out_distill_align_hip', dest='out_distill_align_hip',
+                   action='store_true', default=None,
+                   help='蒸馏前各自减 hip, 只传相对结构。None=随模态(rgb 自动 True, depth False)')
+    p.add_argument('--no_out_distill_align_hip', dest='out_distill_align_hip',
+                   action='store_false')
     p.add_argument('--amp_channels', type=int, default=3)
     p.add_argument('--phase_channels', type=int, default=6)
     p.add_argument('--encoder_hidden_dim', type=int, default=32)
@@ -379,9 +408,20 @@ def get_args():
     p.add_argument('--w_temp', type=float, default=0.1)
     p.add_argument('--w_rel',  type=float, default=6.0)
     p.add_argument('--w_root_anchor', type=float, default=0.5)
+    # [2] L_anchor 退火 (默认不退火 = 原行为)
+    p.add_argument('--w_root_anchor_final', type=float, default=0.1,
+                   help='L_anchor 退火终值(绝对权重下限)')
+    p.add_argument('--anchor_anneal_epochs', type=int, default=0,
+                   help='>0: L_anchor 从 w_root_anchor 线性退火到 w_root_anchor_final 的 epoch 数; 0=不退火')
 
     p.add_argument('--fk_alpha_final', type=float, default=0.4)
     p.add_argument('--fk_alpha_warmup', type=int, default=20)
+
+    # [3] 速度积分 root (需 full_model.py 把 root_mode/vel_scale 透传给 HybridFKPoseDecoder)
+    p.add_argument('--root_mode', type=str, default='absolute', choices=['absolute', 'velocity'],
+                   help='hip root: absolute(原逐帧绝对) / velocity(锚+去均值速度积分轨迹)')
+    p.add_argument('--vel_scale', type=float, default=0.12,
+                   help='velocity 模式每帧位移限幅(米)')
 
     p.add_argument('--archive_ckpts', dest='archive_ckpts', action='store_true', default=True)
     p.add_argument('--no_archive_ckpts', dest='archive_ckpts', action='store_false')
@@ -390,6 +430,9 @@ def get_args():
     # hip 蒸馏权重模态相关默认: depth=4.0, rgb=1.0
     if args.out_distill_hip_weight is None:
         args.out_distill_hip_weight = 4.0 if args.teacher_modality == 'depth' else 1.0
+    # hip 对齐蒸馏模态相关默认: rgb=True, depth=False
+    if args.out_distill_align_hip is None:
+        args.out_distill_align_hip = (args.teacher_modality == 'rgb')
     return args
 
 
@@ -413,9 +456,11 @@ def main():
     logger.info('=' * 70)
     logger.info(f'  lambda_feat={args.lambda_feat} lambda_out={args.lambda_out} '
                 f'out_distill_hip_weight={args.out_distill_hip_weight} '
-                f'({"默认随模态" if args.teacher_modality else ""}) lambda_hip={args.lambda_hip}')
+                f'align_hip={args.out_distill_align_hip} lambda_hip={args.lambda_hip}')
     logger.info(f'  struct: w_bone={args.w_bone} w_sym={args.w_sym} w_temp={args.w_temp} w_rel={args.w_rel}')
-    logger.info(f'  root anchor: w_root_anchor={args.w_root_anchor}')
+    logger.info(f'  root anchor: w_root_anchor={args.w_root_anchor} '
+                f'final={args.w_root_anchor_final} anneal_epochs={args.anchor_anneal_epochs}')
+    logger.info(f'  root_mode={args.root_mode} vel_scale={args.vel_scale}')
     logger.info(f'  FK: alpha_final={args.fk_alpha_final} warmup={args.fk_alpha_warmup}')
     logger.info(f'  EMA={"ON" if args.use_ema else "OFF"} epochs={args.epochs} '
                 f'archive_ckpts={args.archive_ckpts}')
@@ -428,6 +473,17 @@ def main():
     student = CSIRSCPoseDG(args).to(device)
     logger.info(f'Student params: {count_parameters(student):,}')
     load_pretrained_backbone(student, args.pretrain_ckpt, logger)
+
+    # velocity root 透传自检: full_model 是否真把 root_mode 传进了 FK 支
+    if args.root_mode == 'velocity':
+        _md = student.module if hasattr(student, 'module') else student
+        _fk = getattr(getattr(_md, 'pose_decoder', None), 'fk', None)
+        if _fk is None or getattr(_fk, 'root_mode', 'absolute') != 'velocity':
+            logger.warning('[root_mode=velocity] 但 pose_decoder.fk 未运行在 velocity 模式! '
+                           'full_model.py 可能没把 args.root_mode 透传给 HybridFKPoseDecoder。'
+                           '请按文件末尾说明加一行, 否则本开关无效。')
+        else:
+            logger.info(f'[root_mode=velocity] FK 支已确认 velocity (vel_scale={getattr(_fk,"vel_scale",None)})')
 
     canonical = None
     if args.w_root_anchor > 0:
@@ -454,7 +510,8 @@ def main():
     feat_distill_fn = FeatureDistillLoss(args.distill_cos_w, args.distill_sl1_w)
     out_distill_fn = OutputDistillLoss(beta=args.out_distill_beta,
                                        hip_weight=args.out_distill_hip_weight,
-                                       num_joints=args.num_joints, hip_joint_idx=0).to(device)
+                                       num_joints=args.num_joints, hip_joint_idx=0,
+                                       align_hip=args.out_distill_align_hip).to(device)
     evaluator = PoseEvaluator(unit='meter')
 
     optimizer = build_optimizer(student, proj, args.lr_backbone, args.lr_head, args.weight_decay)
@@ -472,6 +529,18 @@ def main():
                      1.0 - (1.0 - args.fk_alpha_final) * (epoch - 1) / max(1, args.fk_alpha_warmup))
             _md.pose_decoder.set_alpha(_a)
             logger.info(f'[FK] epoch {epoch} alpha={_a:.3f}')
+
+        # === L_anchor 退火: 前期强按住防漂, 后期放开让网络学轨迹 (anneal_epochs=0 时恒为 w_root_anchor) ===
+        if args.anchor_anneal_epochs > 0:
+            _frac = min(1.0, (epoch - 1) / max(1, args.anchor_anneal_epochs))
+            args._w_anchor_cur = (args.w_root_anchor
+                                  + (args.w_root_anchor_final - args.w_root_anchor) * _frac)
+        else:
+            args._w_anchor_cur = args.w_root_anchor
+        if args.w_root_anchor > 0:
+            logger.info(f'[anchor] epoch {epoch} w_root_anchor={args._w_anchor_cur:.3f}'
+                        f'{" (velocity: 只约束时间均值hip)" if args.root_mode=="velocity" else ""}')
+
         tm = train_one_epoch(student, proj, teacher, train_loader, optimizer, canonical,
                              total_loss_fn, pose_loss_fn, feat_distill_fn, out_distill_fn,
                              device, epoch, logger, args, ema=ema)
