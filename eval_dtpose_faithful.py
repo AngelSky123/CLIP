@@ -44,7 +44,7 @@ DTPOSE_PA = 104.2
 # ----------------------------------------------------------------------
 # 模型构建: 复刻 train_distill_pretrained.py 的架构默认值 (纯 Hybrid FK, 无 rawscale)
 # ----------------------------------------------------------------------
-def build_model_args(seq_len):
+def build_model_args(seq_len, root_mode='absolute', vel_scale=0.12):
     return SimpleNamespace(
         amp_channels=3, phase_channels=6,
         encoder_hidden_dim=32, encoder_out_dim=64,
@@ -55,19 +55,33 @@ def build_model_args(seq_len):
         num_joints=17, num_actions=27,
         rsc2_time_drop_pct=0.5, rsc2_channel_drop_pct=0.5, rsc2_batch_pct=0.5,
         seq_len=seq_len, use_vision_backbone=False,
+        root_mode=root_mode, vel_scale=vel_scale,
     )
 
 
 def load_student(ckpt_path, seq_len, device):
-    margs = build_model_args(seq_len)
-    student = CSIRSCPoseDG(margs).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
     if 'model_state_dict' not in ckpt:
         raise KeyError(f"ckpt 缺少 'model_state_dict'; got {list(ckpt.keys())}")
-    miss, unexp = student.load_state_dict(ckpt['model_state_dict'], strict=True)
+    sd = ckpt['model_state_dict']
+    # 从 FK 支 key 自动探测 root_mode:
+    #   axis_split -> fk.vel_head_x + fk.root_head_yz
+    #   velocity   -> fk.vel_head
+    #   absolute   -> fk.root_head
+    if any('fk.vel_head_x' in k for k in sd):
+        root_mode = 'axis_split'
+    elif any('fk.vel_head' in k for k in sd):
+        root_mode = 'velocity'
+    else:
+        root_mode = 'absolute'
+    margs = build_model_args(seq_len, root_mode=root_mode)
+    student = CSIRSCPoseDG(margs).to(device)
+    miss, unexp = student.load_state_dict(sd, strict=True)
     if miss or unexp:
         raise RuntimeError(f"state_dict 不匹配: missing={miss[:5]} unexpected={unexp[:5]}")
     student.eval()
+    student._root_mode = root_mode
+    print(f'[load] {os.path.basename(ckpt_path)} -> root_mode={root_mode}')
     return student, ckpt.get('epoch', None), ckpt.get('metrics', {})
 
 

@@ -23,12 +23,14 @@ Step B+v3: depth/RGB -> CSI 蒸馏, 从 Stage1B 预训练 backbone 出发。
       需要 distill_loss.OutputDistillLoss 已含 align_hip 参数。
   [2] L_anchor 退火     --anchor_anneal_epochs N (>0 开启) / --w_root_anchor_final F
       前期强按住 root 附近防漂, 后期线性退火到 F, 让网络敢学轨迹。N=0 时为原行为。
-  [3] 速度积分 root      --root_mode {absolute(原), velocity} / --vel_scale
-      velocity: hip = 锚 + 去均值的速度积分轨迹 (接 fk_decoder.py 的 FKBranch)。
+  [3] 速度积分 root      --root_mode {absolute(原), velocity, axis_split} / --vel_scale
+      velocity:   hip = 锚 + 去均值的速度积分轨迹 (接 fk_decoder.py 的 FKBranch)。
+      axis_split: x 轴走 velocity(敢动, 不锚), y/z 走 absolute(锚定) — 由缝合诊断的
+                  逐轴 oracle 结论驱动 (S5: x用会动的预测在源域一致降 hip 14~40mm)。
       ★ 需 full_model.py 把 args.root_mode/args.vel_scale 透传给 HybridFKPoseDecoder
         (见文件末尾说明)。未透传时本开关不生效但不报错。
-      velocity 模式下 L_anchor 只约束【时间均值 hip = canonical】, 放开轨迹,
-      否则逐帧 anchor 会把速度积分学到的轨迹重新摁平。
+      velocity 模式下 L_anchor 只约束【时间均值 hip = canonical】, 放开轨迹;
+      axis_split 模式下 L_anchor 只约束【y/z 两轴】, 放开 x (否则 x 又被锚死)。
 ============================================================================
 """
 import os
@@ -196,12 +198,12 @@ def build_loaders(args, logger):
 # ----------------------------------------------------------------------
 def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
                     total_loss_fn, pose_loss_fn, feat_distill_fn, out_distill_fn,
-                    device, epoch, logger, args, ema=None):
+                    device, epoch, logger, args, ema=None, dtx_teacher=None):
     student.train(); proj.train()
     meters = {k: AverageMeter() for k in
               ['loss', 'l_pose_clean', 'l_cons', 'l_action',
                'l_distill_feat', 'l_distill_out', 'l_distill_out_mm',
-               'l_struct', 'l_anchor']}
+               'l_struct', 'l_anchor', 'l_dtx']}
     accum = getattr(args, 'accumulate_grad', 1)
     action_loss_fn = nn.CrossEntropyLoss()
     optimizer.zero_grad()
@@ -211,6 +213,7 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
     # L_anchor 当前权重 (epoch 循环里按退火设到 args._w_anchor_cur; 缺省回退到原 w_root_anchor)
     w_anchor_cur = getattr(args, '_w_anchor_cur', args.w_root_anchor)
     vel_mode = (getattr(args, 'root_mode', 'absolute') == 'velocity')
+    axis_split_mode = (getattr(args, 'root_mode', 'absolute') == 'axis_split')
 
     for i, batch in enumerate(loader):
         csi = batch['csi'].to(device)
@@ -247,17 +250,31 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
         total = total + l_struct
         meters['l_struct'].update(float(l_struct.detach()), csi.shape[0])
 
-        # === root anchor (支持退火 + velocity 模式只约束时间均值) ===
+        # === root anchor (velocity: 只约束时间均值; axis_split: 只锚 y/z, 放开 x) ===
         if w_anchor_cur > 0 and canonical is not None:
             pred_hip = outputs['p_final_clean'][:, :, 0, :]      # (B,T,3)
             tgt_hip = canonical[action_labels]                   # (B,3)
-            if vel_mode:
+            if axis_split_mode:
+                # x 轴(idx 0)敢动、不锚; 只把 y/z(idx 1,2)逐帧拉向源域 canonical。
+                # x 的绝对位置交给 pose loss 自学 (复现 S5: x 用会动的预测)。
+                l_anchor = F.smooth_l1_loss(
+                    pred_hip[..., 1:], tgt_hip[:, None, 1:].expand_as(pred_hip[..., 1:]))
+            elif vel_mode:
                 # 只把【时间均值 hip】拉向 canonical, 放开零均值轨迹 (否则会摁平速度积分)
                 l_anchor = F.smooth_l1_loss(pred_hip.mean(dim=1), tgt_hip)
             else:
                 l_anchor = F.smooth_l1_loss(pred_hip, tgt_hip[:, None, :].expand_as(pred_hip))
             total = total + w_anchor_cur * l_anchor
             meters['l_anchor'].update(float(l_anchor.detach()), csi.shape[0])
+
+        # === [B1] DT x 轴轨迹蒸馏: 给 x "往哪动" 的方向信号 ===
+        if dtx_teacher is not None and args.w_dtx > 0:
+            x_traj_t = dtx_teacher(csi)                              # (B,T) DT hip.x 去均值轨迹
+            x_hip_s = outputs['p_final_clean'][:, :, 0, 0]          # (B,T) student hip.x
+            x_traj_s = x_hip_s - x_hip_s.mean(dim=1, keepdim=True)  # 去均值 (只对齐怎么动)
+            l_dtx = F.smooth_l1_loss(x_traj_s, x_traj_t, beta=0.05)
+            total = total + args.w_dtx * l_dtx
+            meters['l_dtx'].update(float(l_dtx.detach()), csi.shape[0])
 
         (total / accum).backward()
         if (i + 1) % accum == 0 or (i + 1) == len(loader):
@@ -281,6 +298,8 @@ def train_one_epoch(student, proj, teacher, loader, optimizer, canonical,
             if use_out:
                 msg += (f' Out: {meters["l_distill_out"].avg:.4f}'
                         f' (~{meters["l_distill_out_mm"].avg:.0f}mm)')
+            if dtx_teacher is not None and args.w_dtx > 0:
+                msg += f' DTx: {meters["l_dtx"].avg:.4f}'
             logger.info(msg)
         del outputs, total, teacher_in
         if use_feat or use_out:
@@ -305,8 +324,12 @@ def monitor_e04(student, loader, device, evaluator, logger):
     preds = torch.cat(all_preds); gts = torch.cat(all_gts)
     m = evaluator.evaluate(preds, gts)
     m['hip_error (mm)'] = hip_error(preds, gts) * 1000.0
+    # 额外: root 逐轴 std (看 axis_split 下 x 轴是否真的敢动了)
+    hip_pred = preds[:, :, 0, :].reshape(-1, 3).numpy()
+    ax_std = hip_pred.std(0) * 1000.0
     logger.info(f'  [E04 滑窗监控] MPJPE: {m["MPJPE (mm)"]:.2f} MPJPE_a: {m["MPJPE_aligned (mm)"]:.2f} '
-                f'hip: {m["hip_error (mm)"]:.2f} PA: {m["PA-MPJPE (mm)"]:.2f}')
+                f'hip: {m["hip_error (mm)"]:.2f} PA: {m["PA-MPJPE (mm)"]:.2f} '
+                f'| root_std(x,y,z)=({ax_std[0]:.0f},{ax_std[1]:.0f},{ax_std[2]:.0f})mm')
     return m
 
 
@@ -417,11 +440,20 @@ def get_args():
     p.add_argument('--fk_alpha_final', type=float, default=0.4)
     p.add_argument('--fk_alpha_warmup', type=int, default=20)
 
-    # [3] 速度积分 root (需 full_model.py 把 root_mode/vel_scale 透传给 HybridFKPoseDecoder)
-    p.add_argument('--root_mode', type=str, default='absolute', choices=['absolute', 'velocity'],
-                   help='hip root: absolute(原逐帧绝对) / velocity(锚+去均值速度积分轨迹)')
+    # [3] root 模式 (需 full_model.py 把 root_mode/vel_scale 透传给 HybridFKPoseDecoder)
+    p.add_argument('--root_mode', type=str, default='absolute',
+                   choices=['absolute', 'velocity', 'axis_split'],
+                   help='hip root: absolute / velocity / axis_split(x走velocity敢动, y/z锚定)')
     p.add_argument('--vel_scale', type=float, default=0.12,
-                   help='velocity 模式每帧位移限幅(米)')
+                   help='velocity/axis_split 模式每帧位移限幅(米)')
+    # [B1] DT-Pose x 轴轨迹蒸馏 (只在 axis_split 下有意义): 把 DT 的 hip.x 去均值轨迹
+    #      监督你 FK 支的 x 轨迹, 给 x "往哪动" 的方向信号 (补 axis_split 的 x 无偏乱抖)。
+    p.add_argument('--w_dtx', type=float, default=0.0,
+                   help='>0 启用 DT x轴轨迹蒸馏 (建议 0.5~2.0); 0=不启用(原 axis_split)')
+    p.add_argument('--dtx_ckpt', type=str, default=None,
+                   help='DT 预训练整对象 (含encoder), 如 pretrain_dtpose_400.pt')
+    p.add_argument('--dtx_decoder_ckpt', type=str, default=None,
+                   help='DT 阶段二解码器 state_dict, 如 pose_dtpose.pt')
 
     p.add_argument('--archive_ckpts', dest='archive_ckpts', action='store_true', default=True)
     p.add_argument('--no_archive_ckpts', dest='archive_ckpts', action='store_false')
@@ -474,16 +506,18 @@ def main():
     logger.info(f'Student params: {count_parameters(student):,}')
     load_pretrained_backbone(student, args.pretrain_ckpt, logger)
 
-    # velocity root 透传自检: full_model 是否真把 root_mode 传进了 FK 支
-    if args.root_mode == 'velocity':
+    # root_mode 透传自检: full_model 是否真把 root_mode 传进了 FK 支
+    if args.root_mode in ('velocity', 'axis_split'):
         _md = student.module if hasattr(student, 'module') else student
         _fk = getattr(getattr(_md, 'pose_decoder', None), 'fk', None)
-        if _fk is None or getattr(_fk, 'root_mode', 'absolute') != 'velocity':
-            logger.warning('[root_mode=velocity] 但 pose_decoder.fk 未运行在 velocity 模式! '
+        if _fk is None or getattr(_fk, 'root_mode', 'absolute') != args.root_mode:
+            logger.warning(f'[root_mode={args.root_mode}] 但 pose_decoder.fk 未运行在该模式! '
                            'full_model.py 可能没把 args.root_mode 透传给 HybridFKPoseDecoder。'
                            '请按文件末尾说明加一行, 否则本开关无效。')
         else:
-            logger.info(f'[root_mode=velocity] FK 支已确认 velocity (vel_scale={getattr(_fk,"vel_scale",None)})')
+            logger.info(f'[root_mode={args.root_mode}] FK 支已确认 (vel_scale={getattr(_fk,"vel_scale",None)})')
+            if args.root_mode == 'axis_split':
+                logger.info('  [axis_split] x轴=velocity(敢动,不锚), y/z=absolute(由L_anchor只锚y/z)')
 
     canonical = None
     if args.w_root_anchor > 0:
@@ -500,6 +534,21 @@ def main():
     if sum(p.numel() for p in teacher.parameters() if p.requires_grad) != 0:
         raise RuntimeError('teacher not frozen')
     logger.info(f'Teacher loaded (frozen, modality={args.teacher_modality}).')
+
+    # [B1] DT x 轴轨迹教师 (可选)
+    dtx_teacher = None
+    if args.w_dtx > 0:
+        if args.root_mode != 'axis_split':
+            logger.warning(f'[B1] --w_dtx>0 但 root_mode={args.root_mode} (非 axis_split), '
+                           'x 轨迹蒸馏作用有限, 建议配 --root_mode axis_split。')
+        if not args.dtx_ckpt:
+            raise ValueError('--w_dtx>0 需要 --dtx_ckpt (DT 预训练整对象)')
+        from dtpose_rootx_teacher import DTPoseRootXTeacher
+        dtx_teacher = DTPoseRootXTeacher(args.dtx_ckpt, args.dtx_decoder_ckpt, device=device).to(device)
+        if sum(p.numel() for p in dtx_teacher.parameters() if p.requires_grad) != 0:
+            raise RuntimeError('DT-x teacher not frozen')
+        logger.info(f'[B1] DT x 轴轨迹蒸馏 ON, w_dtx={args.w_dtx} '
+                    f'(蒸 DT hip.x 去均值轨迹 -> student FK x 轨迹)')
 
     proj = DistillProjection(args.global_dim, args.global_dim).to(device)
     total_loss_fn = TotalLoss(lambda1=args.lambda1, lambda2=args.lambda2, lambda3=args.lambda3,
@@ -538,12 +587,16 @@ def main():
         else:
             args._w_anchor_cur = args.w_root_anchor
         if args.w_root_anchor > 0:
-            logger.info(f'[anchor] epoch {epoch} w_root_anchor={args._w_anchor_cur:.3f}'
-                        f'{" (velocity: 只约束时间均值hip)" if args.root_mode=="velocity" else ""}')
+            _note = ''
+            if args.root_mode == 'velocity':
+                _note = ' (velocity: 只约束时间均值hip)'
+            elif args.root_mode == 'axis_split':
+                _note = ' (axis_split: 只锚 y/z, 放开 x)'
+            logger.info(f'[anchor] epoch {epoch} w_root_anchor={args._w_anchor_cur:.3f}{_note}')
 
         tm = train_one_epoch(student, proj, teacher, train_loader, optimizer, canonical,
                              total_loss_fn, pose_loss_fn, feat_distill_fn, out_distill_fn,
-                             device, epoch, logger, args, ema=ema)
+                             device, epoch, logger, args, ema=ema, dtx_teacher=dtx_teacher)
         line = f'[Train] Epoch {epoch} | Loss: {tm["loss"]:.4f} Pose(C): {tm["l_pose_clean"]:.4f}'
         if args.w_root_anchor > 0:
             line += f' Anchor: {tm["l_anchor"]:.4f}'

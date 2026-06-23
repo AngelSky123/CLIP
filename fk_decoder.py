@@ -1,21 +1,30 @@
 """
-fk_decoder.py (v2: root 速度积分模式)
-=====================================
-在原 Hybrid FK 基础上, 给 FK 支的 root 增加【速度积分】模式, 专打 hip 的【轨迹动态】
-(可学、跨域不变的那一块), 不去赌【绝对锚点】(跨房间不可学的那一块)。
+fk_decoder.py (v3: 轴向分离 root 模式 axis_split)
+=================================================
+在 v2 (absolute / velocity) 基础上, 新增 root_mode='axis_split', 由缝合诊断的
+逐轴 oracle 结论驱动:
+
+  诊断事实 (E04, stitch_axis_probe / z_axis_decompose):
+    * x 轴 root 误差 = 大常数 bias(-237) + 高方差 -> 站位平移, 跨域不可观测,
+      但【会动】比【锚死】好 (S5: x 用会动的预测, 源域 hip 一致下降 14~40mm)。
+    * y/z 轴误差主体是【序列间系统常数】, 锚定到源域先验比让它乱跑稳。
+  => 结论: root 的 x 轴该【敢动】(velocity 积分轨迹, 不被 anchor 摁死),
+           y/z 轴该【锚定】(absolute + L_anchor 拉向源域 canonical)。
 
 root_mode:
-  'absolute' (默认, 原行为): root_t = root_head(z_t) 逐帧绝对回归。
-  'velocity' (新):
-        v_t   = tanh(vel_head(z_t)) * vel_scale        # 每帧位移, 限幅 (相对运动, 跨域不变)
-        traj  = cumsum(v) ; traj -= mean_t(traj)       # 绕锚点波动, 去掉系统性长程漂移
-        anchor= anchor_head(mean_t z)                  # 单一绝对锚 (B,3); 由退火 L_anchor 拉向 canonical
-        root_t= anchor + traj
-     => hip 既不被 anchor 摁成常数(有轨迹), 又不让网络去解不可学的绝对映射。
-        anchor 是 hip 的均值, 训练器里的 L_anchor 监督的正是均值 hip -> 无需新接线。
+  'absolute' (原): 三轴都逐帧绝对回归。
+  'velocity' (v2): 三轴都 锚 + 去均值速度积分。
+  'axis_split' (新):
+        x 轴: tanh(vel)*vel_scale 逐帧位移 -> cumsum 轨迹 (不去均值, 让 x 自由漂/动);
+              x 的绝对位置由 pose loss 自己学, 【不】被 L_anchor 约束 (trainer 侧只锚 y/z)。
+        y/z 轴: absolute 逐帧回归 (root_head_yz), 由 L_anchor 拉向源域 canonical。
+     => 单模型一次前向就复现 "S5: x敢动 + y/z锚定" 的行为, 无需缝两个模型。
 
 接口不变: HybridFKPoseDecoder.forward(z_global, action_emb) -> (p_coarse, p_final)。
-仅 __init__ 多两个可选参数 root_mode / vel_scale, 由 full_model 透传 (默认 absolute, 老实验不受影响)。
+__init__ 多 root_mode/vel_scale (透传给 FK 支), 默认 absolute = 原行为, 老实验不受影响。
+
+注: axis_split 下 L_anchor 必须改成【只约束 y/z】(见 train_distill_pretrained.py 改动),
+    否则 x 轴又被锚死, 退化回主线 std=4.5 的摁死状态。
 """
 import torch
 import torch.nn as nn
@@ -49,12 +58,12 @@ def decompose_to_fk(pose, edges=EDGES):
 
 class FKBranch(nn.Module):
     """z_global -> root + bone_dir(单位) + bone_len -> FK 姿态。
-    root_mode: 'absolute' (逐帧绝对) | 'velocity' (锚点 + 速度积分轨迹)。"""
+    root_mode: 'absolute' | 'velocity' | 'axis_split'。"""
     def __init__(self, in_dim=128, edges=EDGES, num_joints=17,
                  hidden=256, len_min=0.02, len_max=0.8,
                  root_mode='absolute', vel_scale=0.12):
         super().__init__()
-        assert root_mode in ('absolute', 'velocity'), root_mode
+        assert root_mode in ('absolute', 'velocity', 'axis_split'), root_mode
         self.edges = edges
         self.num_joints = num_joints
         self.num_bones = len(edges)
@@ -67,18 +76,33 @@ class FKBranch(nn.Module):
         self.len_head = nn.Linear(hidden, self.num_bones)
         if root_mode == 'absolute':
             self.root_head = nn.Linear(hidden, 3)
-        else:
+        elif root_mode == 'velocity':
             self.vel_head = nn.Linear(hidden, 3)      # 每帧位移
             self.anchor_head = nn.Linear(hidden, 3)   # 单一绝对锚 (对时间池化后)
+        else:  # axis_split
+            # x 轴: 敢动 (velocity 积分, 不去均值 -> 允许自由漂移/移动)
+            self.vel_head_x = nn.Linear(hidden, 1)
+            # y/z 轴: 锚定 (逐帧 absolute, 由 trainer 的 L_anchor 拉向源域 canonical)
+            self.root_head_yz = nn.Linear(hidden, 2)
 
     def _root(self, h):                                # h: (B,T,hidden) -> (B,T,3)
         if self.root_mode == 'absolute':
             return self.root_head(h)
-        v = torch.tanh(self.vel_head(h)) * self.vel_scale        # (B,T,3) 限幅位移
-        traj = torch.cumsum(v, dim=1)                            # 积分成轨迹
-        traj = traj - traj.mean(dim=1, keepdim=True)             # 去时间均值 -> 绕锚波动, 不整体漂
-        anchor = self.anchor_head(h.mean(dim=1))                 # (B,3) 绝对锚 (池化, 不逐帧赌)
-        return anchor[:, None, :] + traj                         # (B,T,3)
+        if self.root_mode == 'velocity':
+            v = torch.tanh(self.vel_head(h)) * self.vel_scale        # (B,T,3) 限幅位移
+            traj = torch.cumsum(v, dim=1)                            # 积分成轨迹
+            traj = traj - traj.mean(dim=1, keepdim=True)             # 去时间均值 -> 绕锚波动
+            anchor = self.anchor_head(h.mean(dim=1))                 # (B,3) 绝对锚
+            return anchor[:, None, :] + traj                         # (B,T,3)
+        # ---- axis_split ----
+        B, T, _ = h.shape
+        # x: tanh 限幅每帧位移 -> cumsum 轨迹 (不去均值, 让网络自由学 x 的移动/漂移)
+        vx = torch.tanh(self.vel_head_x(h)) * self.vel_scale          # (B,T,1)
+        x = torch.cumsum(vx, dim=1)                                   # (B,T,1) x 轨迹
+        # y/z: 逐帧 absolute (会被 L_anchor 锚定)
+        yz = self.root_head_yz(h)                                     # (B,T,2)
+        root = torch.cat([x, yz], dim=-1)                            # (B,T,3) = [x, y, z]
+        return root
 
     def forward(self, z):                              # z: (B,T,C)
         B, T, _ = z.shape
@@ -121,7 +145,7 @@ if __name__ == "__main__":
     assert (forward_kinematics(root, d, l) - gt).abs().max() < 1e-4
     print("[FK 可逆性] OK")
 
-    # absolute 模式: 原行为, 前向/反向
+    # absolute 模式: 原行为
     fk_abs = FKBranch(in_dim=128, root_mode='absolute')
     z = torch.randn(B, T, 128, requires_grad=True)
     pose = fk_abs(z); pose.sum().backward()
@@ -132,21 +156,30 @@ if __name__ == "__main__":
     fk_vel = FKBranch(in_dim=128, root_mode="velocity", vel_scale=0.12).eval()
     z2 = torch.randn(B, T, 128, requires_grad=True)
     pose2 = fk_vel(z2)
-    assert pose2.shape == (B, T, J, 3)
-    root2 = pose2[:, :, 0, :]                          # (B,T,3) hip 轨迹
-    # 性质1: 轨迹去均值后绕锚波动 -> root 的时间均值 == anchor (traj 零均值)
     h = fk_vel.trunk(z2); anchor = fk_vel.anchor_head(h.mean(1))
-    err_anchor = (root2.mean(1) - anchor).abs().max().item()
-    print(f"[velocity] root 时间均值 == anchor? 最大差 {err_anchor:.2e} (应~0 -> L_anchor 监督的就是 anchor)")
+    err_anchor = (pose2[:, :, 0, :].mean(1) - anchor).abs().max().item()
     assert err_anchor < 1e-5
-    # 性质2: hip 真的在动 (不是常数) -> 帧间位移非零
-    motion = (root2[:, 1:] - root2[:, :-1]).abs().mean().item()
-    print(f"[velocity] hip 帧间平均位移 = {motion:.4f} (>0: 有轨迹, 不退化成静止点)")
-    assert motion > 1e-4
-    # 性质3: 每帧位移受限 (<= vel_scale)
-    vmax = (root2[:, 1:] - root2[:, :-1]).abs().max().item()
-    print(f"[velocity] 帧间位移上界 ~ {vmax:.3f} (vel_scale={fk_vel.vel_scale})")
-    pose2.sum().backward()
-    assert z2.grad is not None and z2.grad.abs().sum() > 0
-    print("[velocity] 前向/反向 OK, 梯度回流")
+    print("[velocity] root 时间均值 == anchor OK")
+
+    # axis_split 模式 (新)
+    fk_ax = FKBranch(in_dim=128, root_mode="axis_split", vel_scale=0.12)
+    z3 = torch.randn(B, T, 128, requires_grad=True)
+    pose3 = fk_ax(z3)
+    assert pose3.shape == (B, T, J, 3)
+    root3 = pose3[:, :, 0, :]                              # (B,T,3) hip 轨迹
+    # 性质1: x 轴在动 (velocity 积分, 帧间位移非零)
+    x_motion = (root3[:, 1:, 0] - root3[:, :-1, 0]).abs().mean().item()
+    print(f"[axis_split] x 轴帧间位移 = {x_motion:.4f} (>0: x 敢动)")
+    assert x_motion > 1e-5
+    # 性质2: x 轴每帧位移受限 (<= vel_scale)
+    x_step_max = (root3[:, 1:, 0] - root3[:, :-1, 0]).abs().max().item()
+    print(f"[axis_split] x 轴帧间位移上界 ~ {x_step_max:.3f} (vel_scale={fk_ax.vel_scale})")
+    assert x_step_max <= fk_ax.vel_scale + 1e-4
+    # 性质3: y/z 是 absolute 逐帧 (无 cumsum 约束, 可任意)
+    pose3.sum().backward()
+    assert z3.grad is not None and z3.grad.abs().sum() > 0
+    # 性质4: x head 与 yz head 分离
+    assert hasattr(fk_ax, 'vel_head_x') and hasattr(fk_ax, 'root_head_yz')
+    assert not hasattr(fk_ax, 'root_head')      # 没有三轴合一的 root_head
+    print("[axis_split] x=velocity / y,z=absolute 分离 OK, 前向/反向 OK")
     print("\n[ALL OK]")
