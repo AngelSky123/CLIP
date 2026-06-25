@@ -128,6 +128,7 @@ EDGES = [(0,1),(1,2),(2,3),(0,4),(4,5),(5,6),
 **root 模式**（`root_mode`）：
 - `absolute`（默认）：`root_t = root_head(z_t)` 逐帧绝对回归。
 - `velocity`：`v_t = tanh(vel_head(z_t)) · vel_scale`，`traj = cumsum(v) - mean_t(traj)`，`root_t = anchor + traj`；root 时间均值 = anchor，由 `L_anchor` 约束。
+- `axis_split`：x 轴走 velocity 路径（`vel_head_x` → cumsum，不去均值），y/z 轴走 absolute 路径（`root_head_yz` 逐帧回归）。此模式下 `L_anchor` 只约束 y/z 两轴（见 §3.6），x 轴不加 anchor 约束。
 
 ### 3.6 结构正则与 root anchor（`structural_losses.py`）
 
@@ -139,7 +140,7 @@ L_rel    = L1( p − p_hip, g − g_hip )                    # 髋中心相对�
 L_anchor = SmoothL1( p_hip, canonical[action] )          # root 往源域按动作先验拉
 ```
 
-前四项对全局平移不变。`L_anchor` 用源域按动作平均 hip（`build_action_canonical` 预扫训练集 GT，与 E04 无关）做先验。`velocity` 模式下 `L_anchor` 只约束时间均值 hip。
+前四项对全局平移不变。`L_anchor` 用源域按动作平均 hip（`build_action_canonical` 预扫训练集 GT，与 E04 无关）做先验。`velocity` 模式下 `L_anchor` 只约束时间均值 hip。`axis_split` 模式下 `L_anchor` 只约束 y/z 两轴（`p_hip[...,1:]` 对齐 canonical），x 轴放开。
 
 ### 3.7 总损失
 
@@ -150,6 +151,14 @@ L_total = L_pose + L_action
         + w_root_anchor·L_anchor
         + w_dtpose_feat·L_dtpose_feat   (乙′, 可选, §10)
 ```
+
+### 3.8 DT-Pose x 轴轨迹蒸馏（B1，可选，配合 axis_split）
+
+把 §9 阶段二训出的 DT-Pose 解码器作为冻结教师，逐帧输出 hip 的 x 坐标，取其去均值轨迹作为蒸馏目标，监督 axis_split 下 student FK 支的 x 轨迹。
+
+- 组件（`dtpose_rootx_teacher.py::DTPoseRootXTeacher`）：复用乙′的口径转换（`dtpose_feature_teacher._amp_to_dtpose_input`，取 CSI 幅度 3 通道、逐帧 DT-Pose 式 min-max），过 DT-Pose 完整解码器（`train_pose_dtpose_style.ViT_Pose_Decoder`）得 `(B,T,17,3)`，取 hip(joint 0) 的 x、逐序列减时间均值，输出 `(B,T)`（detach）。
+- 损失（`train_distill_pretrained.py`）：student `p_final_clean` 的 hip.x 逐序列去均值后，与教师 x 轨迹做 Smooth-L1（beta=0.05），权重 `--w_dtx`。
+- 参数：`--w_dtx`（默认 0，>0 启用）、`--dtx_ckpt`（DT-Pose 预训练整对象）、`--dtx_decoder_ckpt`（DT-Pose 阶段二解码器）。`--w_dtx 0` 时与原 axis_split 一致。
 
 ---
 
@@ -276,6 +285,34 @@ RGB 教师（`rgb_teacher_dg`，ResNet18 + MixStyle）E04 best：
 | raw / log 幅度输入 | E04 上探针结果见 §11a |
 | 保尺度幅度残差支路（scale=0.3） | faithful 9 ckpt 高于纯先验，已归档 |
 | 乙′ DT-Pose 特征蒸馏（w=0.1, 训练中） | DTfeat loss 0.77→0.71；hip 321 / PA 102.8（ep3） |
+
+### 8.4 axis_split + B1（E04 faithful 逐帧口径）
+
+配置：`--root_mode axis_split --w_dtx 1.0`，RGB 教师，其余同 §13.4 默认。全 12 epoch archive，faithful sweep 逐 ckpt 评测。各 seed best-MPJPE 的 checkpoint（raw）：
+
+| seed | best-MPJPE epoch | MPJPE | hip | PA |
+|---|---|---:|---:|---:|
+| 42 | ep4 | 311.48 | 273.87 | 103.59 |
+| 0  | ep6 | 311.70 | 278.39 | 105.26 |
+| 1  | ep5 | 327.55 | 295.83 | 105.20 |
+| 7  | ep4 | 352.11 | 322.08 | 104.28 |
+
+DT-Pose (S3/P3) 参考值：MPJPE 316.8 / PA 104.2。
+
+同一轮内 best-MPJPE 与 best-PA 落在不同 epoch。以 seed 0 为例（faithful sweep 部分行）：
+
+| epoch | MPJPE | hip | PA |
+|---|---:|---:|---:|
+| 6  | 311.70 | 278.39 | 105.26 |
+| 7  | 355.59 | 322.59 | 103.55 |
+| 9  | 348.60 | 314.83 | 103.40 |
+| 10 | 350.09 | 319.03 | 102.55 |
+
+观察：各 seed 的 best-MPJPE checkpoint 其 PA 高于该 seed 的 best-PA checkpoint；x 轴 root std 较大的 epoch（如 seed 0 ep6，hip 278.39）其 PA（105.26）高于 x 轴 std 较小、hip 较高的 epoch（如 ep10，hip 319.03 / PA 102.55）。
+
+axis_split 下 E04 raw root 的 x 轴 std 实测在 8（ep1）→ 40~82（ep3 起）区间；y/z 轴 std 维持 12~20。B1 训练中 DTx 蒸馏损失（w_dtx=1.0，seed 42）单调下降：ep1 内 0.163 → 0.031。
+
+> 上述为 raw checkpoint 的 faithful 值；同配置 EMA checkpoint 的 best-MPJPE 在各 seed 上为 349~358（hip 323~328）。
 
 ---
 
@@ -433,6 +470,12 @@ python train_distill_pretrained.py \
     --dtpose_feat_ckpt pretrain_dtpose_400.pt --w_dtpose_feat 0.1
 ```
 
+启用 axis_split + B1（DT x 轴轨迹蒸馏）：追加
+```bash
+    --root_mode axis_split \
+    --w_dtx 1.0 --dtx_ckpt pretrain_dtpose_400.pt --dtx_decoder_ckpt pose_dtpose.pt
+```
+
 ### 13.5 E04 选点（faithful sweep，唯一权威口径）
 
 ```bash
@@ -485,7 +528,9 @@ python probe_transformer_hip.py --data_root /home/a123456/PerceptAlign/MMFi \
 | 姿态 | `--lambda1/2/3` / `--lambda_hip` | 1/0.5/2 / 0.3 | PoseLoss |
 | 结构 | `--w_bone/--w_sym/--w_temp/--w_rel` | 1.0/0.1/0.1/6.0 | 结构正则 |
 | FK | `--fk_alpha_final` / `--fk_alpha_warmup` | 0.4 / 20 | α 终值 / 退火 |
-| FK | `--root_mode` / `--vel_scale` | absolute / 0.12 | root 模式 |
+| FK | `--root_mode` / `--vel_scale` | absolute / 0.12 | root 模式（absolute / velocity / axis_split） |
+| B1 | `--w_dtx` | 0 | DT x 轴轨迹蒸馏权重（>0 启用，配 axis_split） |
+| B1 | `--dtx_ckpt` / `--dtx_decoder_ckpt` | None / None | DT-Pose 预训练 / 阶段二解码器 |
 | root | `--w_root_anchor` | 0.5 | L_anchor 强度 |
 | root | `--anchor_anneal_epochs` / `--w_root_anchor_final` | 0 / 0.1 | anchor 退火 |
 | RSC | `--rsc2_*_pct` | 0.5 | challenge 比例 |
@@ -505,7 +550,8 @@ RSC V2/
 ├── train_rgb_teacher.py          # Stage A (主线): RGB 教师 (ResNet18+MixStyle)
 ├── train_depth_teacher.py        # Stage A (历史): 深度教师
 ├── train_mae.py                  # Stage 1A: MAE 自监督预训练 (主 backbone)
-├── fk_decoder.py                 # Hybrid FK 解码器 (absolute / velocity root)
+├── fk_decoder.py                 # Hybrid FK 解码器 (absolute / velocity / axis_split root)
+├── dtpose_rootx_teacher.py       # B1: DT-Pose 解码器作冻结教师, 出 hip.x 去均值轨迹
 ├── structural_losses.py          # 骨长/对称/时序/root-relative/root-anchor + canonical
 ├── eval_dtpose_faithful.py       # 逐帧 faithful 评测 + E04 选点 sweep (权威)
 ├── evaluate.py / evaluate_v2.py  # 指标 / 训练期监控
