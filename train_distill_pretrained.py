@@ -144,9 +144,23 @@ def load_pretrained_backbone(student, ckpt_path, logger):
     missing = [k for k in required if k not in ckpt]
     if missing:
         raise KeyError(f"pretrain ckpt missing keys: {missing}")
+    use_complex = getattr(student.csi_encoder, 'use_complex', False)
     for mod_name in required:
         m, u = getattr(student, mod_name).load_state_dict(ckpt[mod_name], strict=False)
         logger.info(f'  {mod_name}: missing={len(m)} unexpected={len(u)}')
+        # csi_encoder 在复数模式下, 相位分支结构变化(phase_branch.*)预期不匹配:
+        # 旧ckpt是实数 phase_branch.block*, 新结构是复数 phase_branch.cconv*/cact*。
+        # 允许这些 phase_branch.* 的 missing/unexpected, 其余(amp_branch/fusion)仍须匹配。
+        if mod_name == 'csi_encoder' and use_complex:
+            m_bad = [k for k in m if not k.startswith('phase_branch.')]
+            u_bad = [k for k in u if not k.startswith('phase_branch.')]
+            n_phase = len([k for k in m if k.startswith('phase_branch.')])
+            logger.info(f'    [复数相位] phase_branch 跳过加载(随机初始化重学), 共 {n_phase} 个新参数; '
+                        f'非相位 missing={len(m_bad)} unexpected={len(u_bad)}')
+            if m_bad or u_bad:
+                raise RuntimeError(f'KEY MISMATCH csi_encoder(非相位部分): '
+                                   f'missing={m_bad[:5]} unexpected={u_bad[:5]}')
+            continue
         if m or u:
             raise RuntimeError(f'KEY MISMATCH {mod_name}: missing={m[:5]} unexpected={u[:5]}')
     logger.info(f'Loaded pretrained: {list(required)}')
@@ -381,6 +395,10 @@ def get_args():
     p.add_argument('--phase_channels', type=int, default=6)
     p.add_argument('--encoder_hidden_dim', type=int, default=32)
     p.add_argument('--encoder_out_dim', type=int, default=64)
+    p.add_argument('--use_complex', action='store_true', default=True,
+                   help='相位分支用复数卷积(C-MambaPose式), 默认开')
+    p.add_argument('--no_complex', dest='use_complex', action='store_false',
+                   help='相位分支回退为原实数sin/cos卷积(A/B对照)')
     p.add_argument('--local_hidden_dim', type=int, default=64)
     p.add_argument('--local_out_dim', type=int, default=64)
     p.add_argument('--num_res3d_blocks', type=int, default=2)

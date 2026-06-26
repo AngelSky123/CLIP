@@ -11,6 +11,71 @@ import torch.nn.functional as F
 from .mixstyle import MixStyle2D
 
 
+# ============================================================
+# 复数相位处理组件 (移植自 C-MambaPose, arXiv:2606.13700)
+# 保持相位 real/imag 复数耦合, 替代"早拆sin/cos喂普通卷积"
+# ============================================================
+class ComplexConv2d(nn.Module):
+    """复数2D卷积: (a+bi)*(W_r+W_i i). 输入/输出通道前半实部后半虚部。"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, dilation=1, stride=1):
+        super().__init__()
+        assert in_channels % 2 == 0 and out_channels % 2 == 0
+        ri, ro = in_channels // 2, out_channels // 2
+        self.conv_r = nn.Conv2d(ri, ro, kernel_size, padding=padding, dilation=dilation, stride=stride, bias=False)
+        self.conv_i = nn.Conv2d(ri, ro, kernel_size, padding=padding, dilation=dilation, stride=stride, bias=False)
+
+    def forward(self, x):
+        x_r, x_i = torch.chunk(x, 2, dim=1)
+        out_r = self.conv_r(x_r) - self.conv_i(x_i)
+        out_i = self.conv_r(x_i) + self.conv_i(x_r)
+        return torch.cat([out_r, out_i], dim=1)
+
+
+class ComplexModReLU(nn.Module):
+    """相位保持激活: 只对幅度做ReLU(mag+b), 相位角不变。"""
+    def __init__(self, channels):
+        super().__init__()
+        self.b = nn.Parameter(torch.zeros(channels // 2))
+
+    def forward(self, x):
+        x_r, x_i = torch.chunk(x, 2, dim=1)
+        magnitude = torch.sqrt(x_r ** 2 + x_i ** 2 + 1e-8)
+        b = self.b.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        ratio = F.relu(magnitude + b) / magnitude
+        return torch.cat([x_r * ratio, x_i * ratio], dim=1)
+
+
+class ComplexPhaseBranch(nn.Module):
+    """复数相位分支: 输入(B*T,6,114,10)=[sin(3);cos(3)], 重排为复数[real=cos;imag=sin],
+    经复数卷积+ModReLU(保持相位相干), 末端取幅度转实数, 输出(B*T,out_dim,114,10)。
+    接口与 PhaseAwareBranch 完全一致 (输出实数 out_dim 通道), 后续网络无需改。
+    """
+    def __init__(self, in_channels=6, hidden_dim=32, out_dim=64):
+        super().__init__()
+        # 环境归一化(对原始sin/cos做, 在复数运算前) - 保留域泛化
+        self.env_norm = EnvironmentNormalization(in_channels)
+        # 复数通道: out_dim 实数 = out_dim复数(out_dim/2 real + out_dim/2 imag)
+        hc = hidden_dim * 2   # 复数隐藏(实部hidden+虚部hidden)
+        oc = out_dim * 2      # 复数输出
+        self.cconv1 = ComplexConv2d(6, hc, kernel_size=3, padding=1)
+        self.cact1  = ComplexModReLU(hc)
+        self.cconv2 = ComplexConv2d(hc, oc, kernel_size=3, padding=1)
+        self.cact2  = ComplexModReLU(oc)
+
+    def forward(self, x):
+        # x: (B*T, 6, 114, 10) = [sin_3ant ; cos_3ant]
+        x = self.env_norm(x)
+        sin_p, cos_p = x[:, :3], x[:, 3:]
+        # 复数排列: 前半=实部(cos), 后半=虚部(sin)
+        z = torch.cat([cos_p, sin_p], dim=1)        # (B*T,6,114,10)
+        z = self.cact1(self.cconv1(z))
+        z = self.cact2(self.cconv2(z))              # (B*T, out_dim*2, 114,10)
+        # 取幅度转实数: sqrt(real^2+imag^2) -> out_dim 通道
+        z_r, z_i = torch.chunk(z, 2, dim=1)
+        return torch.sqrt(z_r ** 2 + z_i ** 2 + 1e-8)   # (B*T, out_dim, 114,10)
+
+
+
 class EnvironmentNormalization(nn.Module):
     """环境归一化: Per-sample instance normalization on CSI features.
     
@@ -146,13 +211,19 @@ class DualBranchCSIEncoder(nn.Module):
     """
 
     def __init__(self, amp_channels=3, phase_channels=6,
-                 hidden_dim=32, out_dim=64, chunk_size=16):
+                 hidden_dim=32, out_dim=64, chunk_size=16, use_complex=True):
         super().__init__()
         self.amp_channels = amp_channels
         self.phase_channels = phase_channels
         self.chunk_size = chunk_size
+        self.use_complex = use_complex
         self.amp_branch = AmplitudeBranch(amp_channels, hidden_dim, out_dim)
-        self.phase_branch = PhaseAwareBranch(phase_channels, hidden_dim, out_dim)
+        if use_complex:
+            # 复数相位分支(移植自C-MambaPose): 保持相位real/imag耦合
+            self.phase_branch = ComplexPhaseBranch(phase_channels, hidden_dim, out_dim)
+        else:
+            # 原实数分支(sin/cos当独立通道喂普通卷积)
+            self.phase_branch = PhaseAwareBranch(phase_channels, hidden_dim, out_dim)
         self.fusion = GatedFusion(out_dim)
 
     def _process_chunk(self, amp_chunk, phase_chunk):

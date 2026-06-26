@@ -54,6 +54,7 @@ class CSIRSCPoseDG(nn.Module):
                 phase_channels=args.phase_channels,
                 hidden_dim=args.encoder_hidden_dim,
                 out_dim=args.encoder_out_dim,
+                use_complex=getattr(args, 'use_complex', True),
             )
             self.local_encoder = LocalSpatioTemporalEncoder(
                 in_channels=args.encoder_out_dim,
