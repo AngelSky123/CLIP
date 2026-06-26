@@ -24,15 +24,29 @@ class CSIPreprocessor:
 
     @staticmethod
     def process_phase(phase):
-        phase_unwrap = np.unwrap(phase, axis=-2)
-        shape = phase_unwrap.shape
-        phase_flat = phase_unwrap.reshape(-1, shape[-2])
-        phase_detrend = detrend(phase_flat, axis=-1)
-        phase_detrend = phase_detrend.reshape(shape)
-        sin_p = np.sin(phase_detrend)
-        cos_p = np.cos(phase_detrend)
-        phase_encoded = np.concatenate([sin_p, cos_p], axis=1)
-        return np.nan_to_num(phase_encoded, nan=0.0)
+        """C-MambaPose 式相位 sanitization (最小二乘 SFO/CFO 校正):
+        沿子载波轴 unwrap -> 对每个 (天线, packet) 沿 114 子载波最小二乘拟合斜率 m 与
+        截距 c -> 减去 (s*m + c) -> sin/cos 编码。
+        修正点: 旧实现用 reshape(-1,114)+detrend, 因内存布局会把 packet 维与子载波维错位,
+        未能正确去除 SFO/CFO 斜率; 此处沿正确的子载波轴显式拟合。
+        phase: (..., 3, 114, 10), 子载波在 axis=-2。输出 [sin,cos] 沿通道 3->6。"""
+        phase_unwrap = np.unwrap(phase, axis=-2)              # 沿子载波解卷绕
+        N = phase_unwrap.shape[-2]                            # 114
+        s = np.arange(N, dtype=np.float64)
+        s_mean = s.mean()
+        s_centered = s - s_mean
+        denom = (s_centered ** 2).sum() + 1e-12
+        # 子载波轴移到最后, 对每条沿子载波拟合: (..., 3, 10, 114)
+        pu = np.moveaxis(phase_unwrap, -2, -1)
+        theta_mean = pu.mean(axis=-1, keepdims=True)
+        m = ((pu - theta_mean) * s_centered).sum(axis=-1, keepdims=True) / denom
+        c = theta_mean - m * s_mean
+        theta_clean = pu - (s * m + c)                       # 减线性拟合
+        theta_clean = np.moveaxis(theta_clean, -1, -2)       # 还原 (..., 3, 114, 10)
+        sin_p = np.sin(theta_clean)
+        cos_p = np.cos(theta_clean)
+        phase_encoded = np.concatenate([sin_p, cos_p], axis=-3)   # 沿天线通道 3->6
+        return np.nan_to_num(phase_encoded, nan=0.0).astype(np.float32)
 
     @staticmethod
     def preprocess(amp, phase):
